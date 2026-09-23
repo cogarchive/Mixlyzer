@@ -1,3 +1,11 @@
-from .migration import get_migration_path, migrate_library
+from .adapter import (
+    LibraryMigrationAdapter,
+    LibraryMigrationStatus,
+    library_migration,
+)
 
-__all__ = ["get_migration_path", "migrate_library"]
+__all__ = [
+    "LibraryMigrationAdapter",
+    "LibraryMigrationStatus",
+    "library_migration",
+]

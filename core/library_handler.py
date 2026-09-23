@@ -235,13 +235,6 @@ class LibraryDB:
             UNIQUE(track_uid, seq_index)
         );
         """)
-        # Self-healing schema upgrade: add per-segment time signature (numerator)
-        # to libraries that were created before this column existed. Keeps the
-        # library version fixed at 0.2.0 without requiring a migration step.
-        if not self._column_exists("track_bpm_segments", "time_signature"):
-            self._conn.execute(
-                "ALTER TABLE track_bpm_segments ADD COLUMN time_signature INTEGER DEFAULT 4;"
-            )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_tbs_track_uid ON track_bpm_segments(track_uid);")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_tbs_bpm_duration ON track_bpm_segments(bpm_rounded, duration_sec);")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_tks_track_uid ON track_key_segments(track_uid);")
@@ -267,10 +260,6 @@ class LibraryDB:
         c.execute("PRAGMA temp_store=MEMORY;")
         c.execute("PRAGMA mmap_size=3000000000;")
         c.close()
-
-    def _column_exists(self, table: str, col: str) -> bool:
-        cur = self.conn.execute(f"PRAGMA table_info({table});")
-        return any(row["name"] == col for row in cur.fetchall())
 
     @contextmanager
     def tx(self):

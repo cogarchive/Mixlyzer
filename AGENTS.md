@@ -39,7 +39,7 @@ Working notes for AI/automation agents editing the Mixlyzer codebase.
 - `views/`: pyqtgraph view plugins registered through `views.base.REGISTRY`.
 - `utils/`: labels, colors, fonts, JumpCUE extraction/render helpers, keystrip utilities, waveform helpers.
 - `third_party/`: export adapters such as Rekordbox XML generation.
-- `migration/`: library schema/version migrations.
+- `migration/`: read-only library-version compatibility adapter; no migration implementation is currently provided.
 - `build/`: PyInstaller spec.
 - `docs/`: localized docs (`README.ko.md`, `README.ja.md`).
 - `assets/`: icons, fonts, sounds.
@@ -52,7 +52,7 @@ Working notes for AI/automation agents editing the Mixlyzer codebase.
   - loads `config.json`,
   - ensures the library directory exists,
   - checks `library/VERSION`,
-  - runs migration steps from `migration/` if the on-disk library version is behind `CURRENT_LIBRARY_VERSION`,
+  - checks the on-disk library version through the migration adapter and stops on a mismatch,
   - creates and shows `AppWindow`.
 - `AppWindow` creates the shared `EventBus`, `DataModel`, `TimelineCoordinator`, `PlayerController`, `ExternalSyncController`, `SegmentReanalysisManager`, and `MainPane`.
 - UI state is mostly signal-driven. Feature/property/album-art signals are notifications only; listeners read current values from the shared `DataModel`.
