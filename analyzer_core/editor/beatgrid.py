@@ -83,6 +83,8 @@ def rebuild_grid_from_segments(segments) -> np.ndarray:
     if arr.ndim != 2 or arr.shape[1] < 4:
         return np.asarray([], dtype=float)
     beats = []
+    valid_ends = arr[:, 1][np.isfinite(arr[:, 1])]
+    track_end = float(np.max(valid_ends)) if valid_ends.size else float("inf")
     for start, end, bpm, inizio in arr[:, :4]:
         if not (np.isfinite(start) and np.isfinite(end) and end > start):
             continue
@@ -103,7 +105,10 @@ def rebuild_grid_from_segments(segments) -> np.ndarray:
                 beat -= period
             while beat < start:
                 beat += period
-        end_limit = float(end) + 1e-1
+        # Interior segments overshoot slightly so a beat on the boundary is not lost (the
+        # duplicate is pruned below); the last segment ends at the audio end, so beats past
+        # it would be inaudible and unannotatable.
+        end_limit = float(end) + 1e-1 if float(end) < track_end else float(end) + 1e-6
         while beat < end_limit:
             beats.append(beat)
             beat += period
