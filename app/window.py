@@ -83,6 +83,10 @@ class AppWindow(QtWidgets.QMainWindow):
             failure_callback=self._on_external_sync_failure,
         )
         self.rekordbox_sync = RekordboxXmlSync(cfg_getter=lambda: self.cfg, parent=self)
+        self.rekordbox_sync.started.connect(self.bus.sig_rekordbox_sync_started)
+        self.rekordbox_sync.progress.connect(self.bus.sig_rekordbox_sync_progress)
+        self.rekordbox_sync.finished.connect(self.bus.sig_rekordbox_sync_finished)
+        self.rekordbox_sync.failed.connect(self.bus.sig_rekordbox_sync_failed)
 
         # Main UI pane
         self.pane = MainPane(self.bus, self.model, self.tl, self.cfg)

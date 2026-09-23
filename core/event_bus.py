@@ -1,6 +1,4 @@
 from PySide6 import QtCore
-from core.library_handler import TrackRow
-from typing import List
 
 class EventBus(QtCore.QObject):
     # Player/Timeline
@@ -39,8 +37,12 @@ class EventBus(QtCore.QObject):
 
     # Config Window
     sig_setting_saveJsonRequested = QtCore.Signal(object)
-    sig_rekordbox_sync_requested = QtCore.Signal(bool)
+    sig_rekordbox_sync_requested = QtCore.Signal(object)
     sig_rekordbox_sync_track_requested = QtCore.Signal(str)
+    sig_rekordbox_sync_started = QtCore.Signal(object)
+    sig_rekordbox_sync_progress = QtCore.Signal(object, int, str)
+    sig_rekordbox_sync_finished = QtCore.Signal(object, object)
+    sig_rekordbox_sync_failed = QtCore.Signal(object, str)
 
     # reload configs
     sig_reload_UI = QtCore.Signal(object)

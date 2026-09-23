@@ -6,17 +6,64 @@ import io
 import json
 import subprocess
 from PySide6.QtCore import Qt, Signal
-from PySide6 import QtGui
+from PySide6 import QtCore, QtGui
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLineEdit, QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QLabel, QDialogButtonBox, QGroupBox, QPushButton,
-    QScrollArea)
+    QMessageBox, QProgressBar, QScrollArea)
 from core.config import (
     config, libconfig, viewconfig, playbackconfig, analysisconfig, keyconfig, externalsyncconfig,
     memorydeckconfig, memoryvalueconfig,
 )
 from core.event_bus import EventBus
 from core.resource_paths import process_denylist_path
+
+
+class RekordboxSyncProgressDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sync Rekordbox XML")
+        self.setModal(False)
+        self._running = True
+
+        self.lbl_status = QLabel("Waiting for Rekordbox XML worker")
+        self.lbl_status.setWordWrap(True)
+        self.bar_progress = QProgressBar()
+        self.bar_progress.setRange(0, 100)
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.lbl_status)
+        layout.addWidget(self.bar_progress)
+        layout.addWidget(self.btn_close, alignment=Qt.AlignRight)
+        self.resize(520, 125)
+
+    def closeEvent(self, event) -> None:
+        if self._running:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def set_progress(self, value: int, text: str) -> None:
+        self.bar_progress.setValue(max(0, min(100, int(value))))
+        self.lbl_status.setText(str(text or "Syncing Rekordbox XML"))
+
+    def set_finished(self, result) -> None:
+        self._running = False
+        self.bar_progress.setValue(100)
+        summary = f"Done — {result.entry_count} XML entries"
+        if result.reused_count:
+            summary += f", {result.reused_count} unchanged entries reused"
+        self.lbl_status.setText(f"{summary}\n{result.output_path}")
+        self.btn_close.setEnabled(True)
+
+    def set_failed(self, message: str) -> None:
+        self._running = False
+        self.lbl_status.setText(f"Rekordbox XML sync failed:\n{message}")
+        self.btn_close.setEnabled(True)
+
 
 class SettingsDialog(QDialog):
 
@@ -49,8 +96,23 @@ class SettingsDialog(QDialog):
         root.addWidget(self.btn_box)
 
         self._current_cfg = None 
+        self._rekordbox_sync_dialog: RekordboxSyncProgressDialog | None = None
+        self._rekordbox_progress_request = None
+        self._accept_next_library_sync = False
         if self._bus is not None:
             self._bus.sig_ui_draw_interval.connect(self._on_ui_draw_interval)
+            self._bus.sig_rekordbox_sync_started.connect(
+                self._on_rekordbox_sync_started
+            )
+            self._bus.sig_rekordbox_sync_progress.connect(
+                self._on_rekordbox_sync_progress
+            )
+            self._bus.sig_rekordbox_sync_finished.connect(
+                self._on_rekordbox_sync_finished
+            )
+            self._bus.sig_rekordbox_sync_failed.connect(
+                self._on_rekordbox_sync_failed
+            )
 
     # Tabs
     def _make_tab_library(self):
@@ -601,8 +663,83 @@ class SettingsDialog(QDialog):
         if self._bus is None:
             return
         cfg = self.get_config()
+        if not cfg.libconfig.rekordbox_sync_enabled:
+            QMessageBox.warning(
+                self, "Sync Rekordbox XML", "Enable Sync with Rekordbox XML first."
+            )
+            return
+        if not cfg.libconfig.rekordbox_xml_path.strip():
+            QMessageBox.warning(
+                self, "Sync Rekordbox XML", "Rekordbox XML Path is empty."
+            )
+            return
+        previous_libcfg = getattr(self._current_cfg, "libconfig", None)
+        sync_config_changed = (
+            previous_libcfg is None
+            or bool(previous_libcfg.rekordbox_sync_enabled)
+            != bool(cfg.libconfig.rekordbox_sync_enabled)
+            or str(previous_libcfg.rekordbox_xml_path).strip()
+            != str(cfg.libconfig.rekordbox_xml_path).strip()
+        )
+        if self._rekordbox_sync_dialog is not None:
+            self._rekordbox_sync_dialog.deleteLater()
+        self._rekordbox_sync_dialog = RekordboxSyncProgressDialog(self)
+        self._rekordbox_sync_dialog.show()
+        self.btn_rekordbox_sync_now.setEnabled(False)
+        self._rekordbox_progress_request = None
+        self._accept_next_library_sync = sync_config_changed
         self.saveJsonRequested.emit(cfg)
-        self._bus.sig_rekordbox_sync_requested.emit(True)
+        if not sync_config_changed:
+            self._bus.sig_rekordbox_sync_requested.emit(
+                {"full_rebuild": True, "show_progress": True}
+            )
+
+    @QtCore.Slot(object)
+    def _on_rekordbox_sync_started(self, request) -> None:
+        show_progress = bool(getattr(request, "show_progress", False))
+        accepts_saved_config_sync = (
+            self._accept_next_library_sync
+            and getattr(request, "mode", "") == "library"
+        )
+        if not show_progress and not accepts_saved_config_sync:
+            return
+        self._accept_next_library_sync = False
+        self._rekordbox_progress_request = request
+        dialog = self._rekordbox_sync_dialog
+        if dialog is not None:
+            dialog.set_progress(0, "Rekordbox XML worker started")
+            dialog.show()
+            dialog.raise_()
+
+    @QtCore.Slot(object, int, str)
+    def _on_rekordbox_sync_progress(
+        self, request, value: int, message: str
+    ) -> None:
+        if request is not self._rekordbox_progress_request:
+            return
+        dialog = self._rekordbox_sync_dialog
+        if dialog is not None:
+            dialog.set_progress(value, message)
+
+    @QtCore.Slot(object, object)
+    def _on_rekordbox_sync_finished(self, request, result) -> None:
+        if request is not self._rekordbox_progress_request:
+            return
+        self.btn_rekordbox_sync_now.setEnabled(True)
+        dialog = self._rekordbox_sync_dialog
+        if dialog is not None:
+            dialog.set_finished(result)
+        self._rekordbox_progress_request = None
+
+    @QtCore.Slot(object, str)
+    def _on_rekordbox_sync_failed(self, request, message: str) -> None:
+        if request is not self._rekordbox_progress_request:
+            return
+        self.btn_rekordbox_sync_now.setEnabled(True)
+        dialog = self._rekordbox_sync_dialog
+        if dialog is not None:
+            dialog.set_failed(message)
+        self._rekordbox_progress_request = None
 
     def _sync_external_sync_mode_ui(self):
         is_time_sync = self.cmb_external_sync_mode.currentIndex() == 0

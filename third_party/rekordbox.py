@@ -4,7 +4,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 import math
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 from urllib.parse import quote
 from uuid import UUID
 from xml.dom import minidom
@@ -19,7 +19,13 @@ from utils.jump_cues import extract_jump_cue_graph
 
 ResolvePath = Callable[[str | None], Optional[Path]]
 
-__all__ = ["build_rekordbox_xml", "sanitize_filename"]
+__all__ = [
+    "RekordboxXmlDocument",
+    "build_rekordbox_track_element",
+    "build_rekordbox_xml",
+    "rekordbox_track_key_for_row",
+    "sanitize_filename",
+]
 
 
 def build_rekordbox_xml(
@@ -29,6 +35,29 @@ def build_rekordbox_xml(
     resolve_path: ResolvePath,
     audio_path: Optional[Path] = None,
 ) -> tuple[str, str]:
+    resolved_audio = audio_path if audio_path and audio_path.exists() else None
+    track_element = build_rekordbox_track_element(
+        track,
+        features,
+        resolve_path=resolve_path,
+        audio_path=resolved_audio,
+    )
+    document = RekordboxXmlDocument.new()
+    document.append_track(track_element)
+    song_title = track_element.attrib.get("Name", "Untitled")
+    return document.to_xml(), f"{sanitize_filename(song_title)}_rekordbox.xml"
+
+
+def build_rekordbox_track_element(
+    track: TrackRow,
+    features: dict[str, np.ndarray],
+    *,
+    resolve_path: ResolvePath,
+    audio_path: Optional[Path] = None,
+    extra_attributes: dict[str, str] | None = None,
+) -> ET.Element:
+    """Build the canonical Rekordbox ``TRACK`` element for every export path."""
+
     tempo_segments = _extract_tempo_segments(features)
     duration = _get_duration(track, features)
     average_bpm = _compute_average_bpm(track, tempo_segments, features)
@@ -52,7 +81,7 @@ def build_rekordbox_xml(
     elif track.file_size:
         file_size = int(track.file_size)
 
-    sample_rate = 44100
+    sample_rate = int(_safe_scalar(features.get("sr")) or 44100)
     tempo_global = _safe_scalar(features.get("tempo_global"))
     if not np.isfinite(average_bpm) or average_bpm <= 0:
         average_bpm = tempo_global if tempo_global > 0 else 0.0
@@ -62,8 +91,6 @@ def build_rekordbox_xml(
         bit_rate = int(round((file_size * 8) / duration / 1000))
 
     song_title = track.title or (resolved_audio.stem if resolved_audio else "Untitled")
-    xml_filename = f"{sanitize_filename(song_title)}_rekordbox.xml"
-
     track_id = _generate_track_id(track)
     tonality = ""
     if track.key is not None:
@@ -71,10 +98,6 @@ def build_rekordbox_xml(
             tonality = idx_to_labels(track.key)[0]
         except Exception:
             tonality = ""
-
-    root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
-    ET.SubElement(root, "PRODUCT", Name="Mixlyzer", Version="1.0.0", Company="Mixlyzer")
-    collection = ET.SubElement(root, "COLLECTION", Entries="1")
 
     track_attrs = {
         "TrackID": track_id,
@@ -84,7 +107,9 @@ def build_rekordbox_xml(
         "Album": track.album or "",
         "Grouping": "",
         "Genre": "",
-        "Kind": _kind_from_path(resolved_audio or (resolve_path(track.path) if track.path else None)),
+        "Kind": _kind_from_path(
+            resolved_audio or (resolve_path(track.path) if track.path else None)
+        ),
         "Size": str(file_size),
         "TotalTime": str(int(round(duration)) if duration > 0 else 0),
         "DiscNumber": "1",
@@ -103,7 +128,9 @@ def build_rekordbox_xml(
         "Label": "",
         "Mix": "",
     }
-    track_elem = ET.SubElement(collection, "TRACK", track_attrs)
+    if extra_attributes:
+        track_attrs.update({str(key): str(value) for key, value in extra_attributes.items()})
+    track_elem = ET.Element("TRACK", track_attrs)
 
     fallback_ts = int(max(1, _safe_scalar(features.get("timesignature")) or 4))
     tempo_entries = _tempo_entries_for_xml(tempo_segments, average_bpm)
@@ -140,11 +167,117 @@ def build_rekordbox_xml(
             Blue=str(color[2]),
         )
 
-    xml_bytes = ET.tostring(root, encoding="utf-8")
-    pretty = minidom.parseString(xml_bytes).toprettyxml(indent="  ")
-    if not pretty.startswith("<?xml"):
-        pretty = '<?xml version="1.0" encoding="UTF-8"?>\n' + pretty
-    return pretty, xml_filename
+    return track_elem
+
+
+def rekordbox_track_key_for_row(track: TrackRow) -> str:
+    uid = str(track.uid or "").strip()
+    return uid or _generate_track_id(track)
+
+
+def _rekordbox_track_key_for_element(track: ET.Element) -> str:
+    uid = str(track.attrib.get("MixlyzerUID", "")).strip()
+    return uid or str(track.attrib.get("TrackID", "")).strip()
+
+
+class RekordboxXmlDocument:
+    """XML document operations shared by one-track export and library sync."""
+
+    def __init__(self, root: ET.Element, collection: ET.Element) -> None:
+        self.root = root
+        self.collection = collection
+        self._reindex()
+
+    @classmethod
+    def new(cls) -> "RekordboxXmlDocument":
+        root = ET.Element("DJ_PLAYLISTS", Version="1.0.0")
+        ET.SubElement(
+            root,
+            "PRODUCT",
+            Name="Mixlyzer",
+            Version="1.0.0",
+            Company="Mixlyzer",
+        )
+        collection = ET.SubElement(root, "COLLECTION", Entries="0")
+        return cls(root, collection)
+
+    @classmethod
+    def load(
+        cls,
+        path: str | Path,
+        *,
+        force_new: bool = False,
+    ) -> "RekordboxXmlDocument":
+        xml_path = Path(path)
+        if not force_new and xml_path.exists():
+            try:
+                root = ET.fromstring(xml_path.read_text(encoding="utf-8"))
+            except (OSError, ET.ParseError, UnicodeError) as exc:
+                raise ValueError(f"Cannot read Rekordbox XML: {xml_path}") from exc
+            collection = root.find("COLLECTION")
+            if collection is None:
+                raise ValueError(f"Rekordbox XML has no COLLECTION: {xml_path}")
+            return cls(root, collection)
+        return cls.new()
+
+    def _reindex(self) -> None:
+        self.existing: dict[str, ET.Element] = {}
+        for track in self.collection.findall("TRACK"):
+            key = _rekordbox_track_key_for_element(track)
+            if key:
+                self.existing[key] = track
+
+    def existing_track(self, key: str) -> ET.Element | None:
+        return self.existing.get(str(key))
+
+    def remove_track(self, key: str) -> None:
+        normalized_key = str(key)
+        removed = False
+        for track in list(self.collection.findall("TRACK")):
+            if _rekordbox_track_key_for_element(track) == normalized_key:
+                self.collection.remove(track)
+                removed = True
+        self.existing.pop(normalized_key, None)
+        if removed:
+            self._update_entry_count()
+
+    def append_track(self, track: ET.Element) -> None:
+        self.collection.append(track)
+        key = _rekordbox_track_key_for_element(track)
+        if key:
+            self.existing[key] = track
+        self._update_entry_count()
+
+    def replace_tracks(self, tracks: Iterable[ET.Element]) -> None:
+        nodes = list(tracks)
+        self.collection.clear()
+        self.collection.extend(nodes)
+        self._update_entry_count()
+        self._reindex()
+
+    @property
+    def entry_count(self) -> int:
+        return len(self.collection.findall("TRACK"))
+
+    def _update_entry_count(self) -> None:
+        self.collection.set("Entries", str(self.entry_count))
+
+    def to_xml(self) -> str:
+        _strip_whitespace_only_nodes(self.root)
+        xml_bytes = ET.tostring(self.root, encoding="utf-8")
+        pretty = minidom.parseString(xml_bytes).toprettyxml(indent="  ")
+        if not pretty.startswith("<?xml"):
+            pretty = '<?xml version="1.0" encoding="UTF-8"?>\n' + pretty
+        return pretty
+
+
+def _strip_whitespace_only_nodes(element: ET.Element) -> None:
+    if element.text is not None and not element.text.strip():
+        element.text = None
+    for child in list(element):
+        _strip_whitespace_only_nodes(child)
+        if child.tail is not None and not child.tail.strip():
+            child.tail = None
 
 
 def sanitize_filename(name: str) -> str:
@@ -223,7 +356,11 @@ def _tempo_entries_for_xml(
             start, _end, bpm = seg[:3]
             if not np.isfinite(start) or start < 0:
                 continue
-            bpm_val = float(bpm) if np.isfinite(bpm) and bpm > 0 else float(fallback_bpm if fallback_bpm > 0 else 0.0)
+            bpm_val = (
+                float(bpm)
+                if np.isfinite(bpm) and bpm > 0
+                else float(fallback_bpm if fallback_bpm > 0 else 0.0)
+            )
             downbeat = None
             if len(seg) >= 4:
                 try:
@@ -262,7 +399,14 @@ def _tempo_entries_for_xml(
                 }
             )
     if not entries:
-        entries.append({"start": 0.0, "bpm": fallback_bpm if fallback_bpm > 0 else 0.0, "battito": 1, "time_sig": 4})
+        entries.append(
+            {
+                "start": 0.0,
+                "bpm": fallback_bpm if fallback_bpm > 0 else 0.0,
+                "battito": 1,
+                "time_sig": 4,
+            }
+        )
     entries.sort(key=lambda e: e["start"])
     return entries
 
