@@ -2,9 +2,13 @@ from typing import Tuple
 from collections import deque
 from dataclasses import is_dataclass, asdict
 import csv
+from datetime import datetime
 import io
 import json
+from pathlib import Path
+import shutil
 import subprocess
+import traceback
 from PySide6.QtCore import Qt, Signal
 from PySide6 import QtCore, QtGui
 from PySide6.QtWidgets import (
@@ -16,7 +20,113 @@ from core.config import (
     memorydeckconfig, memoryvalueconfig,
 )
 from core.event_bus import EventBus
-from core.resource_paths import process_denylist_path
+from core.resource_paths import process_denylist_path, project_root
+
+
+class ParameterOptimizeWorker(QtCore.QObject):
+    featureProgress = Signal(int, str)
+    optimizeProgress = Signal(int, str)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, optimizer_name: str, request_values: dict, parent=None):
+        super().__init__(parent)
+        self._optimizer_name = optimizer_name
+        self._request_values = request_values
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        try:
+            if self._optimizer_name == "downbeat":
+                from optimizer.downbeat_parameter_optimizer import (
+                    DownbeatOptimizationRequest,
+                    optimize_downbeat_parameters,
+                )
+
+                request = DownbeatOptimizationRequest(**self._request_values)
+                optimize = optimize_downbeat_parameters
+            elif self._optimizer_name == "phrase":
+                from optimizer.phrase_parameter_optimizer import (
+                    PhraseOptimizationRequest,
+                    optimize_phrase_parameters,
+                )
+
+                request = PhraseOptimizationRequest(**self._request_values)
+                optimize = optimize_phrase_parameters
+            else:
+                raise ValueError(f"Unsupported parameter optimizer: {self._optimizer_name}")
+            result = optimize(
+                request,
+                feature_progress=self.featureProgress.emit,
+                optimize_progress=self.optimizeProgress.emit,
+            )
+            self.finished.emit(result)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class ParameterOptimizeProgressDialog(QDialog):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setModal(False)
+
+        self.lbl_feature = QLabel("Feature build pending")
+        self.lbl_feature.setWordWrap(True)
+        self.bar_feature = QProgressBar()
+        self.bar_feature.setRange(0, 100)
+
+        self.lbl_optimize = QLabel("Optimize pending")
+        self.lbl_optimize.setWordWrap(True)
+        self.bar_optimize = QProgressBar()
+        self.bar_optimize.setRange(0, 100)
+
+        self.btn_close = QPushButton("Close")
+        self.btn_close.setEnabled(False)
+        self.btn_close.clicked.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.lbl_feature)
+        layout.addWidget(self.bar_feature)
+        layout.addWidget(self.lbl_optimize)
+        layout.addWidget(self.bar_optimize)
+        layout.addWidget(self.btn_close, alignment=Qt.AlignRight)
+        self.resize(520, 210)
+
+    @QtCore.Slot(int, str)
+    def set_feature_progress(self, value: int, text: str) -> None:
+        self.bar_feature.setValue(max(0, min(100, int(value))))
+        self.lbl_feature.setText(str(text or "Building features"))
+
+    @QtCore.Slot(int, str)
+    def set_optimize_progress(self, value: int, text: str) -> None:
+        self.bar_optimize.setValue(max(0, min(100, int(value))))
+        self.lbl_optimize.setText(str(text or "Optimizing"))
+
+    @QtCore.Slot(str)
+    def set_failed(self, message: str) -> None:
+        self.lbl_optimize.setText("Failed")
+        self.btn_close.setEnabled(True)
+
+    @QtCore.Slot(object)
+    def set_finished(self, _result) -> None:
+        self.bar_feature.setValue(100)
+        self.bar_optimize.setValue(100)
+        skipped_count = len(getattr(_result, "skipped_tracks", ()))
+        skipped_suffix = f", {skipped_count} skipped" if skipped_count else ""
+        if hasattr(_result, "top1_accuracy"):
+            self.lbl_optimize.setText(
+                f"Done — CV top-1 {_result.top1_accuracy:.1%}, "
+                f"cross-entropy {_result.cross_entropy:.4f}{skipped_suffix}"
+            )
+        elif hasattr(_result, "boundary_average_precision"):
+            self.lbl_optimize.setText(
+                f"Done — boundary AP {_result.boundary_average_precision:.1%}, "
+                f"label accuracy {_result.label_accuracy:.1%}{skipped_suffix}"
+            )
+        else:
+            self.lbl_optimize.setText("Done")
+        self.btn_close.setEnabled(True)
 
 
 class RekordboxSyncProgressDialog(QDialog):
@@ -227,6 +337,13 @@ class SettingsDialog(QDialog):
             "Checked: detect per-section downbeat changes (Dynamic).\n"
             "Unchecked: one global downbeat for the whole track (Global)."
         )
+        self.ed_downbeat_parameter_path = QLineEdit()
+        self.ed_downbeat_parameter_path.setPlaceholderText("relative or absolute .json path")
+        self.ed_downbeat_feature_cache_path = QLineEdit()
+        self.btn_reoptimize_downbeat_parameter = QPushButton("Reoptimize Downbeat Parameter")
+        self.btn_reoptimize_downbeat_parameter.clicked.connect(
+            self._on_reoptimize_downbeat_parameter
+        )
         self.sp_bpm_hop = QSpinBox(); self.sp_bpm_hop.setRange(16, 512); self.sp_bpm_hop.setSingleStep(32)
         self.sp_bpm_win = QSpinBox(); self.sp_bpm_win.setRange(1000, 60000); self.sp_bpm_win.setSingleStep(64)
         self.sp_bpm_min = QSpinBox(); self.sp_bpm_min.setRange(60,  400)
@@ -235,6 +352,9 @@ class SettingsDialog(QDialog):
         f_beat.addRow(self.cb_bpm_dynamic)
         f_beat.addRow(self.cb_bpm_adaptive_win)
         f_beat.addRow(self.cb_dynamic_downbeat)
+        f_beat.addRow("Downbeat Parameter Path (json)", self.ed_downbeat_parameter_path)
+        f_beat.addRow("Downbeat Feature Cache Path (directory)", self.ed_downbeat_feature_cache_path)
+        f_beat.addRow(self.btn_reoptimize_downbeat_parameter)
         f_beat.addRow("BPM hop length (samp)", self.sp_bpm_hop)
         f_beat.addRow("BPM Autocorrelation win_length (ms)", self.sp_bpm_win)
         f_beat.addRow("BPM min", self.sp_bpm_min)
@@ -287,10 +407,24 @@ class SettingsDialog(QDialog):
         f_wave.addRow("Env frame (ms)", self.sp_env_frame_ms)
         f_wave.addRow("Env order", self.sp_env_order)
 
+        # Phrase
+        tab_phrase = QWidget(); f_phrase = QFormLayout(tab_phrase)
+        self.cb_phrase_analysis_enabled = QCheckBox("Use Phrase Analysis")
+        self.ed_phrase_parameter_path = QLineEdit()
+        self.ed_phrase_parameter_path.setPlaceholderText("relative or absolute .npz path")
+        self.ed_phrase_feature_cache_path = QLineEdit()
+        self.btn_reoptimize_phrase_parameter = QPushButton("Reoptimize Phrase Parameter")
+        self.btn_reoptimize_phrase_parameter.clicked.connect(self._on_reoptimize_phrase_parameter)
+        f_phrase.addRow(self.cb_phrase_analysis_enabled)
+        f_phrase.addRow("Phrase Parameter Path (npz)", self.ed_phrase_parameter_path)
+        f_phrase.addRow("Phrase Feature Cache Path (directory)", self.ed_phrase_feature_cache_path)
+        f_phrase.addRow(self.btn_reoptimize_phrase_parameter)
+
         # Assemble
         analysis_tabs.addTab(tab_global, "Global")
         analysis_tabs.addTab(tab_beat, "Beat")
         analysis_tabs.addTab(tab_key, "Key")
+        analysis_tabs.addTab(tab_phrase, "Phrase")
         analysis_tabs.addTab(tab_wave, "Waveform")
 
         root.addWidget(analysis_tabs)
@@ -425,12 +559,34 @@ class SettingsDialog(QDialog):
         self.cb_bpm_dynamic.setChecked(bool(a.bpm_dynamic))
         self.cb_bpm_adaptive_win.setChecked(bool(a.bpm_adaptive_window))
         self.cb_dynamic_downbeat.setChecked(bool(getattr(a, "dynamic_downbeat", False)))
+        self.ed_downbeat_parameter_path.setText(
+            str(getattr(a, "downbeat_parameter_path", "") or "")
+        )
+        self.ed_downbeat_feature_cache_path.setText(
+            str(getattr(a, "downbeat_feature_cache_path", "") or "")
+        )
         self.sp_beatgrid_offset.setValue(float(a.beatgrid_offset_msec))
         self.sp_env_frame_ms.setValue(int(a.env_frame_ms))
         self._set_band(self.sp_env_lo_lo,  self.sp_env_lo_hi,  a.env_lo)
         self._set_band(self.sp_env_mid_lo, self.sp_env_mid_hi, a.env_mid)
         self._set_band(self.sp_env_hi_lo,  self.sp_env_hi_hi,  a.env_hi)
         self.sp_env_order.setValue(int(a.env_order))
+        self.cb_phrase_analysis_enabled.setChecked(
+            bool(getattr(a, "phrase_analysis_enabled", True))
+        )
+        self.ed_phrase_parameter_path.setText(
+            str(
+                getattr(
+                    a,
+                    "phrase_parameter_path",
+                    "",
+                )
+                or ""
+            )
+        )
+        self.ed_phrase_feature_cache_path.setText(
+            str(getattr(a, "phrase_feature_cache_path", "") or "")
+        )
 
         # key
         k = cfg.keyconfig
@@ -577,12 +733,17 @@ class SettingsDialog(QDialog):
                 bpm_dynamic=bool(self.cb_bpm_dynamic.isChecked()),
                 bpm_adaptive_window=bool(self.cb_bpm_adaptive_win.isChecked()),
                 dynamic_downbeat=bool(self.cb_dynamic_downbeat.isChecked()),
+                downbeat_parameter_path=self.ed_downbeat_parameter_path.text().strip(),
+                downbeat_feature_cache_path=self.ed_downbeat_feature_cache_path.text().strip(),
                 beatgrid_offset_msec=float(self.sp_beatgrid_offset.value()),
                 env_frame_ms=int(self.sp_env_frame_ms.value()),
                 env_lo=(float(self.sp_env_lo_lo.value()), float(self.sp_env_lo_hi.value())),
                 env_mid=(float(self.sp_env_mid_lo.value()), float(self.sp_env_mid_hi.value())),
                 env_hi=(float(self.sp_env_hi_lo.value()), float(self.sp_env_hi_hi.value())),
                 env_order=int(self.sp_env_order.value()),
+                phrase_analysis_enabled=bool(self.cb_phrase_analysis_enabled.isChecked()),
+                phrase_parameter_path=self.ed_phrase_parameter_path.text().strip(),
+                phrase_feature_cache_path=self.ed_phrase_feature_cache_path.text().strip(),
             ),
             keyconfig=keyconfig(
                 min_offset=float(self.sp_min_offset.value()),
@@ -740,6 +901,254 @@ class SettingsDialog(QDialog):
         if dialog is not None:
             dialog.set_failed(message)
         self._rekordbox_progress_request = None
+
+    def _project_path(self, text: str) -> Path:
+        path = Path(str(text or "").strip())
+        if not path.is_absolute():
+            path = project_root() / path
+        return path
+
+    def _backup_parameter(self, parameter_path: Path) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = project_root() / "backups"
+        backup_path = backup_dir / (
+            f"{parameter_path.stem}.bak_{stamp}{parameter_path.suffix}"
+        )
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(parameter_path, backup_path)
+        return backup_path
+
+    def _confirm_parameter_overwrite(
+        self, parameter_path: Path, title: str, parameter_name: str
+    ) -> bool:
+        if not parameter_path.exists():
+            return True
+        answer = QMessageBox.question(
+            self,
+            title,
+            (
+                f"A new {parameter_name} parameter file will be created at the "
+                "configured path.\nBack up the existing file before overwriting it?"
+            ),
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Yes:
+            try:
+                self._backup_parameter(parameter_path)
+            except Exception as exc:
+                QMessageBox.critical(
+                    self,
+                    title,
+                    f"Failed to back up {parameter_name} parameter:\n{exc}",
+                )
+                return False
+        return True
+
+    def _start_parameter_optimization(
+        self,
+        *,
+        key: str,
+        title: str,
+        request_values: dict,
+        finished_slot,
+        failed_slot,
+    ) -> None:
+        dialog = ParameterOptimizeProgressDialog(title, self)
+        thread = QtCore.QThread(self)
+        worker = ParameterOptimizeWorker(key, request_values)
+        worker.moveToThread(thread)
+
+        worker.featureProgress.connect(dialog.set_feature_progress)
+        worker.optimizeProgress.connect(dialog.set_optimize_progress)
+        worker.finished.connect(dialog.set_finished)
+        worker.failed.connect(dialog.set_failed)
+        worker.finished.connect(finished_slot)
+        worker.failed.connect(failed_slot)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda: setattr(self, f"_{key}_optimize_thread", None)
+        )
+        thread.finished.connect(
+            lambda: setattr(self, f"_{key}_optimize_worker", None)
+        )
+        thread.started.connect(worker.run)
+
+        setattr(self, f"_{key}_optimize_thread", thread)
+        setattr(self, f"_{key}_optimize_worker", worker)
+        setattr(self, f"_{key}_optimize_dialog", dialog)
+        self._set_parameter_optimization_enabled(False)
+        dialog.show()
+        thread.start()
+
+    def _parameter_optimization_is_running(self) -> bool:
+        return any(
+            getattr(self, f"_{key}_optimize_thread", None) is not None
+            for key in ("downbeat", "phrase")
+        )
+
+    def _set_parameter_optimization_enabled(self, enabled: bool) -> None:
+        self.btn_reoptimize_downbeat_parameter.setEnabled(enabled)
+        self.btn_reoptimize_phrase_parameter.setEnabled(enabled)
+
+    @staticmethod
+    def _show_optimization_result(
+        parent, title: str, summary: str, skipped_tracks
+    ) -> None:
+        skipped = tuple(skipped_tracks or ())
+        message = QMessageBox(QMessageBox.Information, title, summary, parent=parent)
+        if skipped:
+            message.setInformativeText(
+                f"Optimization completed after ignoring {len(skipped)} invalid track(s). "
+                "Open Details to see the songs and reasons."
+            )
+            details: list[str] = []
+            for index, track in enumerate(skipped, start=1):
+                details.append(
+                    f"{index}.\n{track.display_name}\n"
+                    f"UUID: {track.uid}\n"
+                    f"Reason: {track.reason}"
+                )
+            message.setDetailedText("\n\n".join(details))
+        message.exec()
+
+    def _on_reoptimize_downbeat_parameter(self) -> None:
+        if self._parameter_optimization_is_running():
+            return
+        title = "Reoptimize Downbeat Parameter"
+        parameter_text = self.ed_downbeat_parameter_path.text().strip()
+        cache_text = self.ed_downbeat_feature_cache_path.text().strip()
+        if not parameter_text:
+            QMessageBox.warning(self, title, "Downbeat Parameter Path (json) is empty.")
+            return
+        if not cache_text:
+            QMessageBox.warning(
+                self, title, "Downbeat Feature Cache Path (directory) is empty."
+            )
+            return
+
+        parameter_path = self._project_path(parameter_text)
+        if not self._confirm_parameter_overwrite(parameter_path, title, "downbeat"):
+            return
+        self._start_parameter_optimization(
+            key="downbeat",
+            title=title,
+            request_values={
+                "library_dir": self._project_path(self.ed_libpath.text().strip()),
+                "cache_dir": self._project_path(cache_text),
+                "output_path": parameter_path,
+                "rebuild_cache": False,
+            },
+            finished_slot=self._on_downbeat_optimize_finished,
+            failed_slot=self._on_downbeat_optimize_failed,
+        )
+
+    def _on_reoptimize_phrase_parameter(self) -> None:
+        if self._parameter_optimization_is_running():
+            return
+        parameter_text = self.ed_phrase_parameter_path.text().strip()
+        cache_text = self.ed_phrase_feature_cache_path.text().strip()
+        if not parameter_text:
+            QMessageBox.warning(
+                self,
+                "Reoptimize Phrase Parameter",
+                "Phrase Parameter Path (npz) is empty.",
+            )
+            return
+        if not cache_text:
+            QMessageBox.warning(
+                self,
+                "Reoptimize Phrase Parameter",
+                "Phrase Feature Cache Path (directory) is empty.",
+            )
+            return
+
+        parameter_path = self._project_path(parameter_text)
+        cache_dir = self._project_path(cache_text)
+        library_dir = self._project_path(self.ed_libpath.text().strip())
+
+        if not self._confirm_parameter_overwrite(
+            parameter_path, "Reoptimize Phrase Parameter", "phrase"
+        ):
+            return
+
+        self._start_parameter_optimization(
+            key="phrase",
+            title="Reoptimize Phrase Parameter",
+            request_values={
+                "library_dir": library_dir,
+                "cache_dir": cache_dir,
+                "output_path": parameter_path,
+                "rebuild_cache": False,
+                "seed": 0,
+            },
+            finished_slot=self._on_phrase_optimize_finished,
+            failed_slot=self._on_phrase_optimize_failed,
+        )
+
+    @QtCore.Slot(object)
+    def _on_downbeat_optimize_finished(self, result) -> None:
+        self._set_parameter_optimization_enabled(True)
+        dialog = getattr(self, "_downbeat_optimize_dialog", self)
+        self._show_optimization_result(
+            dialog,
+            "Reoptimize Downbeat Parameter",
+            (
+                f"Downbeat parameter updated:\n{result.output_path}\n\n"
+                f"Tracks: {result.track_count}, bars: {result.bar_count}\n"
+                f"Selected L2: {result.selected_l2_strength:g}\n"
+                f"CV top-1: {result.top1_accuracy:.1%}, "
+                f"cross-entropy: {result.cross_entropy:.4f}"
+            ),
+            result.skipped_tracks,
+        )
+
+    @QtCore.Slot(str)
+    def _on_downbeat_optimize_failed(self, message: str) -> None:
+        self._set_parameter_optimization_enabled(True)
+        dialog = getattr(self, "_downbeat_optimize_dialog", self)
+        QMessageBox.critical(
+            dialog,
+            "Reoptimize Downbeat Parameter",
+            f"Downbeat parameter optimization failed:\n{message}",
+        )
+
+    @QtCore.Slot(object)
+    def _on_phrase_optimize_finished(self, result) -> None:
+        self._set_parameter_optimization_enabled(True)
+        dialog = getattr(self, "_phrase_optimize_dialog", self)
+        self._show_optimization_result(
+            dialog,
+            "Reoptimize Phrase Parameter",
+            (
+                f"Phrase parameter updated:\n{result.output_path}\n\n"
+                f"Tracks: {result.track_count}\n"
+                f"Training boundary AP: {result.boundary_average_precision:.1%}\n"
+                f"Training boundary F1 @ 0.70: {result.boundary_f1:.1%}\n"
+                f"Training label accuracy: {result.label_accuracy:.1%}\n"
+                f"Training label macro-F1: {result.label_macro_f1:.1%}\n\n"
+                "Interpretation: these in-sample scores only confirm how well "
+                "the model fits its training data. They do not estimate "
+                "performance on unseen tracks."
+            ),
+            result.skipped_tracks,
+        )
+
+    @QtCore.Slot(str)
+    def _on_phrase_optimize_failed(self, message: str) -> None:
+        self._set_parameter_optimization_enabled(True)
+        dialog = getattr(self, "_phrase_optimize_dialog", self)
+        QMessageBox.critical(
+            dialog,
+            "Reoptimize Phrase Parameter",
+            f"Phrase parameter optimization failed:\n{message}",
+        )
 
     def _sync_external_sync_mode_ui(self):
         is_time_sync = self.cmb_external_sync_mode.currentIndex() == 0

@@ -83,12 +83,17 @@ class analysisconfig:
     bpm_dynamic: bool
     bpm_adaptive_window: bool
     dynamic_downbeat: bool
+    downbeat_parameter_path: str
+    downbeat_feature_cache_path: str
     beatgrid_offset_msec: float
     env_frame_ms: int
     env_lo: Tuple[float, float]
     env_mid: Tuple[float, float]
     env_hi: Tuple[float, float]
     env_order: int
+    phrase_analysis_enabled: bool
+    phrase_parameter_path: str
+    phrase_feature_cache_path: str
 
 
 @dataclass
@@ -204,12 +209,17 @@ def default_cfg():
         bpm_dynamic=True,
         bpm_adaptive_window=True,
         dynamic_downbeat=False,
+        downbeat_parameter_path="assets/weights/downbeat_feature_weights.json",
+        downbeat_feature_cache_path="featurecache/downbeat",
         beatgrid_offset_msec=0.0,
         env_frame_ms=4,
         env_lo=(20.0, 200.0),
         env_mid=(200.0, 3000.0),
         env_hi=(3000.0, 11025.0),
         env_order=4,
+        phrase_analysis_enabled=True,
+        phrase_parameter_path="assets/weights/phrase_analyzer.npz",
+        phrase_feature_cache_path="featurecache/phrase",
     )
     kcfg = keyconfig(
         min_offset=0.4,
@@ -283,6 +293,15 @@ def load_cfg() -> config:
         if not lib_path.exists():
             lib_path.mkdir(parents=True, exist_ok=True)
 
+    def _ensure_feature_cache_dirs(cfg: config) -> None:
+        for path_text in (
+            cfg.analysisconfig.downbeat_feature_cache_path,
+            cfg.analysisconfig.phrase_feature_cache_path,
+        ):
+            text = str(path_text or "").strip()
+            if text:
+                Path(text).mkdir(parents=True, exist_ok=True)
+
     cfg = default_cfg()
     try:
         with open("config.json", "r", encoding="utf-8") as f:
@@ -304,4 +323,5 @@ def load_cfg() -> config:
     except (TypeError, FileNotFoundError, json.JSONDecodeError):
         atomic_write_json("config.json", cfg.to_dict(), ensure_ascii=True, indent=None)
     _ensure_library_dir(cfg)
+    _ensure_feature_cache_dirs(cfg)
     return cfg

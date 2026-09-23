@@ -488,8 +488,13 @@ def precompute_features(path: str, config: config, taskmgr: taskmanager, taskid:
         beats_for_db = np.asarray(features.get("beats_time_sec"), dtype=float)
         if seg_arr.shape[0] > 0 and beats_for_db.size >= 2:
             downbeat_method = "dynamic" if bool(getattr(gcf, "dynamic_downbeat", False)) else "global"
+            downbeat_parameter_path = str(gcf.downbeat_parameter_path).strip()
             db_segments = detect_downbeat_offset_segments(
-                samp, int(global_sr), beats_for_db, method=downbeat_method
+                samp,
+                int(global_sr),
+                beats_for_db,
+                method=downbeat_method,
+                weight_path=downbeat_parameter_path,
             )
             print(f"[Downbeat] method={downbeat_method} beats={beats_for_db.size} detected offset segments={len(db_segments)}")
             _head = np.round(beats_for_db[:6], 3).tolist()
@@ -576,7 +581,13 @@ def precompute_features(path: str, config: config, taskmgr: taskmanager, taskid:
     yield {"status": "phrase"}
     print("[Phrase] Analysis Initalized")
     taskmgr.updatetask(taskid, "Phrase Boundary Analyzing", 0.58)
-    if beats_time_arr.size >= 17 and seg_arr.shape[0] > 0:
+    phrase_enabled = bool(getattr(gcf, "phrase_analysis_enabled", True))
+    phrase_parameter_path = str(gcf.phrase_parameter_path).strip()
+    if not phrase_enabled:
+        print("[Phrase] skipped: disabled in analysis settings")
+        features["phrase_segments_np"] = build_phrase_segments_np([])
+        features["cue_points_np"] = empty_cue_points_np()
+    elif beats_time_arr.size >= 17 and seg_arr.shape[0] > 0:
         try:
             # Joint phrase boundary + functional-label detection -> Phrase data.
             # Reuse the already-decoded stereo audio (no second decode).
@@ -585,6 +596,7 @@ def precompute_features(path: str, config: config, taskmgr: taskmanager, taskid:
                 int(global_sr),
                 beats_time_arr,
                 seg_arr,
+                model_path=phrase_parameter_path,
             )
             features["phrase_segments_np"] = build_phrase_segments_np(phrase_segments)
             phrase_cue_points = build_phrase_cue_points(phrase_segments)

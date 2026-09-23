@@ -150,6 +150,11 @@ _DEFAULT_WEIGHT_PATH = resource_path(
     "assets/weights/downbeat_feature_weights.json"
 )
 
+# Public model schema used by the runtime and the parameter optimizer.  Keeping
+# this alias here prevents the training path from maintaining a second feature
+# list that can silently drift from inference.
+DOWNBEAT_FEATURE_NAMES = _DOWNBEAT_FEATURE_NAMES
+
 
 def _beat_patch_rows(
     frames: np.ndarray,
@@ -506,6 +511,37 @@ def _downbeat_feature_matrix(
             f"Downbeat feature count mismatch: {features.shape[1]}"
         )
     return beats.astype(np.float64), features.astype(np.float32)
+
+
+def extract_downbeat_feature_matrix(
+    audio: np.ndarray,
+    sample_rate: int,
+    beat_times_sec: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Extract the exact feature matrix consumed by the current runtime model."""
+
+    return _downbeat_feature_matrix(
+        _mono_audio(audio),
+        sample_rate,
+        beat_times_sec,
+        hop_length=512,
+        n_fft=2048,
+        n_mels=64,
+        beat_phase_bins=8,
+        harmonic_phase_bins=8,
+    )
+
+
+def standardize_downbeat_features(features: np.ndarray) -> np.ndarray:
+    """Apply the runtime model's per-track feature standardization."""
+
+    return _robust_standardize_columns(features)
+
+
+def clear_downbeat_weight_cache() -> None:
+    """Make a newly written weight artifact visible in this process."""
+
+    _load_downbeat_weights.cache_clear()
 
 
 @lru_cache(maxsize=4)

@@ -33,6 +33,8 @@ build/*
 
 # User data / caches
 library/
+featurecache/
+backups/
 debug/
 ffmpeg.exe
 config.json
