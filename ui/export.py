@@ -12,6 +12,7 @@ from core.library_handler import TrackRow
 from core.audio.decoder import decode_to_memmap, get_samplerate
 from core.model import DataModel
 from third_party.rekordbox import build_rekordbox_xml, sanitize_filename
+from utils.atomic_io import atomic_write_text
 from utils.jump_cues import extract_jump_cue_pairs
 from utils.jumprender import jump_renderer
 
@@ -271,8 +272,7 @@ class ExportTrackDialog(QtWidgets.QDialog):
             if reply != QtWidgets.QMessageBox.StandardButton.Yes:
                 return None
         try:
-            with open(xml_path, "w", encoding="utf-8") as f:
-                f.write(xml_text)
+            atomic_write_text(xml_path, xml_text)
         except OSError as exc:
             QtWidgets.QMessageBox.critical(self, "Export Track", f"Failed to write XML file:\n{exc}")
             return None

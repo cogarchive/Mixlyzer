@@ -3,6 +3,8 @@ import json
 from pathlib import Path
 from typing import Literal, Tuple, get_args, get_origin
 
+from utils.atomic_io import atomic_write_json
+
 
 @dataclass
 class libconfig:
@@ -300,7 +302,6 @@ def load_cfg() -> config:
                         merged["playbackconfig"]["metronome_wav_path"] = str(legacy_wav)
             cfg = config.from_dict(merged)
     except (TypeError, FileNotFoundError, json.JSONDecodeError):
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(cfg.to_dict(), f)
+        atomic_write_json("config.json", cfg.to_dict(), ensure_ascii=True, indent=None)
     _ensure_library_dir(cfg)
     return cfg

@@ -1,9 +1,10 @@
 from __future__ import annotations
-import os, json, tempfile, shutil
-from typing import Any, Dict, Iterable, Optional, Tuple
+import os
+from typing import Any, Dict, Optional
 import numpy as np
 
 from core.library_handler import _canonical_uuid4
+from utils.atomic_io import atomic_output_path
 
 def _ensure_dir(d: str) -> str:
     os.makedirs(d, exist_ok=True)
@@ -12,24 +13,6 @@ def _ensure_dir(d: str) -> str:
 
 def _validated_uid(uid: str) -> str:
     return _canonical_uuid4(uid)
-
-def _atomic_write_bytes(path: str, data: bytes) -> None:
-    """Write to a temp file, then atomically replace via os.replace."""
-    d = os.path.dirname(path) or "."
-    _ensure_dir(d)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp_", dir=d)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        raise
 
 def _sanitize_key(k: str) -> str:
     """
@@ -126,24 +109,18 @@ class FeatureNPZStore:
             kv[k2] = arr
 
         if not kv:
-            raise ValueError("No storable feature values (only numeric/bool arrays/lists/scalars are supported).")
+            raise ValueError(
+                "No storable feature values "
+                "(only numeric/bool arrays/lists/scalars are supported)."
+            )
 
-        # 2) Serialize NPZ bytes
-        # np.savez* only accepts file paths, so temp file -> read bytes -> atomic replace
-        tmp_path = os.path.join(self.base_dir, f".tmp_write_{safe_uid}.npz")
-        _ensure_dir(self.base_dir)
-        if self.compressed:
-            np.savez_compressed(tmp_path, **kv)
-        else:
-            np.savez(tmp_path, **kv)
-
-        with open(tmp_path, "rb") as f:
-            data = f.read()
-        os.remove(tmp_path)
-
-        # 3) Atomic save
+        # 2) Serialize directly to a sibling temporary file, then replace.
         final = self.path(safe_uid)
-        _atomic_write_bytes(final, data)
+        with atomic_output_path(final) as temporary:
+            if self.compressed:
+                np.savez_compressed(temporary, **kv)
+            else:
+                np.savez(temporary, **kv)
         return final
 
     def load(self, uid: str) -> Dict[str, np.ndarray]:

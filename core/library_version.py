@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from utils.atomic_io import atomic_write_text
+
 
 DEFAULT_LIBRARY_VERSION = "0.1.0"
 CURRENT_LIBRARY_VERSION = "0.3.0"
@@ -23,8 +25,7 @@ def read_library_version(lib_path: str | Path) -> str:
 
 def write_library_version(lib_path: str | Path, version: str) -> None:
     version_path = version_file_path(lib_path)
-    version_path.parent.mkdir(parents=True, exist_ok=True)
-    version_path.write_text(str(version).strip() + "\n", encoding="utf-8")
+    atomic_write_text(version_path, str(version).strip() + "\n")
 
 
 def ensure_current_version_file(lib_path: str | Path) -> None:

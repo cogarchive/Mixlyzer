@@ -18,18 +18,18 @@ from core.rekordbox_sync import RekordboxXmlSync
 from .metronome import MetronomeController
 from utils.window_visibility import is_window_fully_hidden
 from utils.volume import slider_percent_to_linear, trim_dbfs_to_linear
+from utils.atomic_io import atomic_write_json
 
 from ui.pane import MainPane
 from ui.cfgwindow import SettingsDialog
 from ui.workers import WorkersDialog
 from ui.oss_support import SupportDialog
 from ui.about_dialog import AboutDialog
-from views.base import REGISTRY  # to instantiate default views
 
 from core.analysis_worker import AnalysisWorker
 from core.segment_reanalysis_manager import SegmentReanalysisManager
 from analyzer_core.global_analyzer import getAlbumArt, extract_tags
-from core.config import config, analysisconfig, keyconfig, libconfig, viewconfig, load_cfg
+from core.config import config, load_cfg
 from core.beat_geometry import downbeat_beat_indices
 
 class AppWindow(QtWidgets.QMainWindow):
@@ -498,8 +498,7 @@ class AppWindow(QtWidgets.QMainWindow):
         failed_cfg = self.cfg.to_dict()
         failed_cfg["externalsyncconfig"]["enabled"] = False
         new_cfg = config.from_dict(failed_cfg)
-        with open("config.json", "w", encoding="utf-8") as f:
-            json.dump(new_cfg.to_dict(), f)
+        atomic_write_json("config.json", new_cfg.to_dict(), ensure_ascii=True, indent=None)
         self.cfg = new_cfg
         self.cfgwin.set_config(new_cfg)
         self.external_sync.set_config(new_cfg.externalsyncconfig)
@@ -513,8 +512,7 @@ class AppWindow(QtWidgets.QMainWindow):
     def _on_settings_save(self, _config: config):
         with open("config.json", "r") as f:
             prev_cfg = json.load(f)
-        with open("config.json", "w") as f:
-            json.dump(_config.to_dict(), f)
+        atomic_write_json("config.json", _config.to_dict(), ensure_ascii=True, indent=None)
         self.cfg = _config
         self.cfgwin.set_config(_config)
         self.external_sync.set_config(_config.externalsyncconfig)
