@@ -15,22 +15,82 @@ from analyzer_core.cue_and_phrase.structure import (
     build_predictor_grid,
     extract_song_features,
 )
+from analyzer_core.cue_and_phrase.context_features import CONTEXT_FEATURE_VERSION
+from analyzer_core.cue_and_phrase.model_features import (
+    boundary_feature_matrix,
+    feature_z_from_acoustic,
+    grid_context_feature_matrix,
+    segment_feature_matrix,
+    valid_boundary_mask,
+)
+from analyzer_core.cue_and_phrase.structural_features import (
+    STRUCTURE_FEATURE_VERSION,
+    multi_view_structure_features,
+)
+from utils.atomic_io import atomic_output_path
 
 
 EPS = 1e-9
 NPZ_FORMAT = "mixlyzer_phrase_weight_v1"
+_REQUIRED_SETTINGS = frozenset(
+    {
+        "sr",
+        "hop_length",
+        "n_fft",
+        "n_mels",
+        "n_mfcc",
+        "context_feature_version",
+        "structure_feature_version",
+        "boundary_mode",
+        "boundary_context_beats",
+        "boundary_regional_context_beats",
+        "multi_view_structural_features",
+        "threshold",
+        "min_distance_beats",
+        "max_boundaries",
+        "edge_beats",
+        "boundary_refine_window_beats",
+        "boundary_lengths_beats",
+        "boundary_length_weight",
+        "boundary_shift_penalty",
+        "boundary_downbeat_bonus",
+        "label_context_beats",
+        "label_weight",
+        "transition_weight",
+        "length_weight",
+    }
+)
 
 
 def _parse_feature_config(settings: dict[str, object]) -> FeatureConfig:
-    sr = int(settings.get("sr", 22050))
+    sr = int(settings["sr"])
     return FeatureConfig(
         sample_rate=sr,
-        hop_length=int(settings.get("hop_length", 512)),
-        n_fft=int(settings.get("n_fft", 2048)),
-        n_mels=int(settings.get("n_mels", 48)),
-        n_mfcc=int(settings.get("n_mfcc", 20)),
+        hop_length=int(settings["hop_length"]),
+        n_fft=int(settings["n_fft"]),
+        n_mels=int(settings["n_mels"]),
+        n_mfcc=int(settings["n_mfcc"]),
         fmax=0.5 * sr,
     )
+
+
+def _validate_current_settings(settings: object, path: str) -> dict[str, object]:
+    if not isinstance(settings, dict):
+        raise ValueError(f"Phrase model settings must be a JSON object: {path}")
+    missing = sorted(_REQUIRED_SETTINGS.difference(settings))
+    if missing:
+        raise ValueError(
+            f"Phrase model is missing current settings {missing}: {path}"
+        )
+    if int(settings["context_feature_version"]) != CONTEXT_FEATURE_VERSION:
+        raise ValueError(f"Unsupported Phrase context feature version: {path}")
+    if int(settings["structure_feature_version"]) != STRUCTURE_FEATURE_VERSION:
+        raise ValueError(f"Unsupported Phrase structure feature version: {path}")
+    if str(settings["boundary_mode"]) != "probability":
+        raise ValueError(f"Phrase model does not use the current probability boundary mode: {path}")
+    if not bool(settings["multi_view_structural_features"]):
+        raise ValueError(f"Phrase model does not use current multi-view structure features: {path}")
+    return settings
 
 
 class NumpyHistGradientBoostingClassifier:
@@ -39,7 +99,6 @@ class NumpyHistGradientBoostingClassifier:
     def __init__(
         self,
         *,
-        classes: np.ndarray,
         baseline: np.ndarray,
         tree_classes: np.ndarray,
         tree_offsets: np.ndarray,
@@ -51,7 +110,6 @@ class NumpyHistGradientBoostingClassifier:
         node_right: np.ndarray,
         node_is_leaf: np.ndarray,
     ) -> None:
-        self.classes_ = np.asarray(classes)
         self.baseline = np.asarray(baseline, dtype=np.float64).reshape(-1)
         self.tree_classes = np.asarray(tree_classes, dtype=np.int32).reshape(-1)
         self.tree_offsets = np.asarray(tree_offsets, dtype=np.int64).reshape(-1)
@@ -94,14 +152,6 @@ class NumpyHistGradientBoostingClassifier:
             end = int(self.tree_offsets[tree_index + 1])
             raw[:, int(tree_class)] += self._predict_tree(x, start, end)
         return raw
-
-    def predict(self, X: np.ndarray) -> np.ndarray:
-        raw = self.raw_predict(X)
-        if raw.shape[1] == 1:
-            encoded = (raw.ravel() > 0.0).astype(np.int32)
-        else:
-            encoded = np.argmax(raw, axis=1).astype(np.int32)
-        return self.classes_[encoded]
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         raw = self.raw_predict(X)
@@ -153,12 +203,9 @@ def _hgb_to_npz_payload(prefix: str, clf, payload: dict[str, np.ndarray]) -> Non
 
 
 def export_two_stage_npz_artifact(artifact: dict[str, object], output_path: str | Path) -> None:
-    settings = dict(artifact.get("settings", {}))
+    settings = dict(artifact["settings"])
     payload: dict[str, np.ndarray] = {
         "format": np.asarray(NPZ_FORMAT),
-        "feature_source": np.asarray(str(artifact.get("feature_source", ""))),
-        "fill_policy": np.asarray(str(artifact.get("fill_policy", ""))),
-        "long_segment_split": np.asarray(bool(artifact.get("long_segment_split", False))),
         "settings_json": np.asarray(json.dumps(settings, ensure_ascii=False, sort_keys=True)),
         "label_labels": np.asarray(list(artifact["label_labels"])).astype(str),
         "label_transition": np.asarray(artifact["label_transition"], dtype=np.float64),
@@ -171,12 +218,19 @@ def export_two_stage_npz_artifact(artifact: dict[str, object], output_path: str 
     if out.suffix.lower() != ".npz":
         raise ValueError(f"Phrase artifact output must end with .npz: {out}")
     out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(out, **payload)
+    try:
+        with atomic_output_path(out) as temp_path:
+            np.savez_compressed(temp_path, **payload)
+            # Validate the complete current artifact before replacing a working
+            # model. This also catches truncated ZIP members and schema drift.
+            load_two_stage_model.cache_clear()
+            load_two_stage_model(str(temp_path))
+    finally:
+        load_two_stage_model.cache_clear()
 
 
 def _load_numpy_hgb(archive: np.lib.npyio.NpzFile, prefix: str) -> NumpyHistGradientBoostingClassifier:
     return NumpyHistGradientBoostingClassifier(
-        classes=np.asarray(archive[f"{prefix}_classes"]).astype(str),
         baseline=np.asarray(archive[f"{prefix}_baseline"], dtype=np.float64),
         tree_classes=np.asarray(archive[f"{prefix}_tree_classes"], dtype=np.int32),
         tree_offsets=np.asarray(archive[f"{prefix}_tree_offsets"], dtype=np.int64),
@@ -199,150 +253,26 @@ def load_two_stage_model(path: str) -> dict[str, object]:
         fmt = str(np.asarray(archive["format"]).item())
         if fmt != NPZ_FORMAT:
             raise ValueError(f"Unsupported phrase model artifact: {path}")
-        settings = json.loads(str(np.asarray(archive["settings_json"]).item()))
+        settings = _validate_current_settings(
+            json.loads(str(np.asarray(archive["settings_json"]).item())),
+            path,
+        )
+        boundary_classes = np.asarray(archive["boundary_classes"]).astype(str).tolist()
+        label_classes = np.asarray(archive["label_classes"]).astype(str).tolist()
+        label_labels = np.asarray(archive["label_labels"]).astype(str).tolist()
+        if boundary_classes != ["0", "1"]:
+            raise ValueError(f"Unsupported Phrase boundary classes: {path}")
+        if label_classes != label_labels:
+            raise ValueError(f"Phrase label class order does not match the current format: {path}")
         return {
-            "format": fmt,
-            "feature_source": str(np.asarray(archive["feature_source"]).item()),
-            "fill_policy": str(np.asarray(archive["fill_policy"]).item()),
-            "long_segment_split": bool(np.asarray(archive["long_segment_split"]).item()),
             "settings": settings,
             "boundary_clf": _load_numpy_hgb(archive, "boundary"),
             "label_clf": _load_numpy_hgb(archive, "label"),
-            "label_labels": [str(x) for x in np.asarray(archive["label_labels"]).astype(str)],
+            "label_labels": label_labels,
             "label_transition": np.asarray(archive["label_transition"], dtype=np.float64),
             "label_length_mu": np.asarray(archive["label_length_mu"], dtype=np.float64),
             "label_length_sigma": np.asarray(archive["label_length_sigma"], dtype=np.float64),
         }
-
-
-def _robust_standardize_rows(values: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=np.float64)
-    med = np.median(x, axis=1, keepdims=True)
-    mad = 1.4826 * np.median(np.abs(x - med), axis=1, keepdims=True)
-    std = np.std(x, axis=1, keepdims=True)
-    scale = np.where(mad > 1e-8, mad, np.where(std > 1e-8, std, 1.0))
-    return (x - med) / scale
-
-
-def _column_standardize(values: np.ndarray) -> np.ndarray:
-    x = np.asarray(values, dtype=np.float64)
-    med = np.median(x, axis=0, keepdims=True)
-    mad = 1.4826 * np.median(np.abs(x - med), axis=0, keepdims=True)
-    std = np.std(x, axis=0, keepdims=True)
-    scale = np.where(mad > 1e-8, mad, np.where(std > 1e-8, std, 1.0))
-    return (x - med) / scale
-
-
-def _feature_z_from_acoustic(acoustic) -> np.ndarray:
-    rows = np.vstack(
-        [
-            np.asarray(acoustic.family_beat["timbre"], dtype=np.float64),
-            np.asarray(acoustic.family_beat["harmony"], dtype=np.float64),
-            np.asarray(acoustic.family_beat["rhythm"], dtype=np.float64),
-            np.asarray(acoustic.family_beat["texture"], dtype=np.float64),
-        ]
-    )
-    return _robust_standardize_rows(rows).T.astype(np.float64)
-
-
-def _grid_context_feature_matrix(feature_z: np.ndarray, grid) -> np.ndarray:
-    n = int(np.asarray(feature_z).shape[0])
-    beat_in_bar = np.asarray(grid.beat_in_bar, dtype=np.float64).reshape(-1)
-    bar_index = np.asarray(grid.bar_index_of_beat, dtype=np.float64).reshape(-1)
-    downbeat = np.asarray(grid.downbeat_mask, dtype=bool).reshape(-1)
-    if beat_in_bar.size != n or bar_index.size != n or downbeat.size != n:
-        return np.zeros((n, 0), dtype=np.float64)
-
-    meters = np.asarray(grid.bar_meters, dtype=np.float64).reshape(-1)
-    beat_meters = np.full(n, 4.0, dtype=np.float64)
-    valid_bar = (bar_index >= 0) & (bar_index < meters.size)
-    if meters.size:
-        beat_meters[valid_bar] = np.maximum(meters[bar_index[valid_bar].astype(int)], 1.0)
-    phase = np.mod(beat_in_bar, beat_meters) / np.maximum(beat_meters, 1.0)
-
-    downbeat_idx = np.flatnonzero(downbeat)
-    prev_dist = np.full(n, n, dtype=np.float64)
-    next_dist = np.full(n, n, dtype=np.float64)
-    if downbeat_idx.size:
-        pos = np.searchsorted(downbeat_idx, np.arange(n), side="right") - 1
-        ok = pos >= 0
-        prev_dist[ok] = np.arange(n, dtype=np.float64)[ok] - downbeat_idx[pos[ok]]
-        pos_next = np.searchsorted(downbeat_idx, np.arange(n), side="left")
-        ok_next = pos_next < downbeat_idx.size
-        next_dist[ok_next] = downbeat_idx[pos_next[ok_next]] - np.arange(n, dtype=np.float64)[ok_next]
-    dist_to_downbeat = np.minimum(prev_dist, next_dist) / np.maximum(beat_meters, 1.0)
-
-    rows = [
-        downbeat.astype(np.float64),
-        (beat_in_bar == 1).astype(np.float64),
-        np.sin(2.0 * math.pi * phase),
-        np.cos(2.0 * math.pi * phase),
-        dist_to_downbeat,
-    ]
-    bar_pos = np.maximum(bar_index, 0.0)
-    for period in (2.0, 4.0, 8.0, 16.0):
-        rows.extend(
-            [
-                (np.mod(bar_pos, period) == 0.0).astype(np.float64),
-                np.sin(2.0 * math.pi * bar_pos / period),
-                np.cos(2.0 * math.pi * bar_pos / period),
-            ]
-        )
-    return _column_standardize(np.vstack(rows).T)
-
-
-def _boundary_feature_matrix(
-    feature_z: np.ndarray,
-    windows: Iterable[int],
-    grid_context: np.ndarray | None,
-) -> np.ndarray:
-    x = np.asarray(feature_z, dtype=np.float64)
-    n, d = x.shape
-    wins = tuple(sorted({max(1, int(w)) for w in windows}))
-    grid_context_arr = np.asarray(grid_context, dtype=np.float64) if grid_context is not None else None
-    if grid_context_arr is not None and grid_context_arr.shape[0] != n:
-        grid_context_arr = None
-    rows: list[np.ndarray] = []
-    global_std = np.std(x, axis=0) + EPS
-    for b in range(n):
-        parts = [x[b]]
-        prev_beat = x[max(0, b - 1)]
-        next_beat = x[min(n - 1, b)]
-        parts.extend([next_beat - prev_beat, np.abs(next_beat - prev_beat)])
-        scalar_parts: list[float] = []
-        for w in wins:
-            left = x[max(0, b - w):b]
-            right = x[b:min(n, b + w)]
-            if left.size == 0:
-                left = x[b:b + 1]
-            if right.size == 0:
-                right = x[max(0, b - 1):b]
-            lm = left.mean(axis=0)
-            rm = right.mean(axis=0)
-            diff = rm - lm
-            absdiff = np.abs(diff)
-            parts.extend([diff, absdiff])
-            scalar_parts.extend(
-                [
-                    float(np.mean(absdiff)),
-                    float(np.linalg.norm(diff / global_std) / math.sqrt(d)),
-                    float(np.mean(right.std(axis=0) - left.std(axis=0))),
-                ]
-            )
-        parts.append(np.asarray(scalar_parts, dtype=np.float64))
-        if grid_context_arr is not None and grid_context_arr.size:
-            parts.append(grid_context_arr[b])
-        rows.append(np.concatenate(parts))
-    return np.nan_to_num(_column_standardize(np.vstack(rows)), copy=False)
-
-
-def _valid_mask(n: int, edge_beats: int) -> np.ndarray:
-    valid = np.ones(int(n), dtype=bool)
-    edge = min(max(int(edge_beats), 0), int(n) // 2)
-    valid[:edge] = False
-    if edge:
-        valid[int(n) - edge:] = False
-    return valid
 
 
 def _predict_boundary_probability(clf, boundary_feature_z: np.ndarray, valid: np.ndarray) -> np.ndarray:
@@ -352,41 +282,6 @@ def _predict_boundary_probability(clf, boundary_feature_z: np.ndarray, valid: np
         p[0] = 0.0
         p[-1] = 0.0
     return p
-
-
-def _pick_boundaries_direct(
-    clf,
-    boundary_feature_z: np.ndarray,
-    valid: np.ndarray,
-    probability: np.ndarray,
-    *,
-    min_distance_beats: int,
-    max_boundaries: int | None,
-) -> np.ndarray:
-    hard = np.asarray(clf.predict(np.asarray(boundary_feature_z, dtype=np.float64)), dtype=int) > 0
-    hard &= np.asarray(valid, dtype=bool)
-    if hard.size:
-        hard[0] = False
-        hard[-1] = False
-    runs: list[tuple[int, int]] = []
-    start = None
-    for i, value in enumerate(hard):
-        if value and start is None:
-            start = i
-        elif not value and start is not None:
-            runs.append((start, i))
-            start = None
-    if start is not None:
-        runs.append((start, hard.size))
-    candidates = [max(range(s, e), key=lambda j: float(probability[j])) for s, e in runs]
-    selected: list[int] = []
-    for beat in sorted(candidates, key=lambda i: float(probability[i]), reverse=True):
-        if all(abs(beat - prev) >= int(min_distance_beats) for prev in selected):
-            selected.append(int(beat))
-            if max_boundaries is not None and len(selected) >= int(max_boundaries):
-                break
-    selected.sort()
-    return np.asarray([0, *selected, hard.size], dtype=np.int32)
 
 
 def _pick_boundaries_probability(
@@ -521,42 +416,13 @@ def _refine_boundaries(
     return refined
 
 
-def _segment_features(feature_z: np.ndarray, bounds: np.ndarray) -> np.ndarray:
-    beat_features = np.asarray(feature_z, dtype=np.float64)
-    n = beat_features.shape[0]
-    rows: list[np.ndarray] = []
-    for s0, e0 in zip(bounds[:-1], bounds[1:]):
-        s = int(np.clip(s0, 0, max(n - 1, 0)))
-        e = int(np.clip(e0, s + 1, n))
-        block = beat_features[s:e]
-        head = block[:max(1, min(4, block.shape[0]))].mean(axis=0)
-        tail = block[-max(1, min(4, block.shape[0])):].mean(axis=0)
-        length = float(e - s)
-        rows.append(
-            np.concatenate(
-                [
-                    block.mean(axis=0),
-                    block.std(axis=0),
-                    np.max(block, axis=0),
-                    tail - head,
-                    np.asarray(
-                        [
-                            math.log(max(length, 1.0)),
-                            length / max(n, 1),
-                            s / max(n, 1),
-                            e / max(n, 1),
-                            0.5 * (s + e) / max(n, 1),
-                        ],
-                        dtype=np.float64,
-                    ),
-                ]
-            )
-        )
-    return np.nan_to_num(np.vstack(rows), copy=False)
-
-
-def _label_logp(label_clf, feature_z: np.ndarray, bounds: np.ndarray) -> np.ndarray:
-    X = _segment_features(feature_z, bounds)
+def _label_logp(
+    label_clf,
+    feature_z: np.ndarray,
+    bounds: np.ndarray,
+    context_windows: Iterable[int],
+) -> np.ndarray:
+    X = segment_feature_matrix(feature_z, bounds, context_windows)
     return np.log(np.clip(label_clf.predict_proba(X), 1e-7, 1.0))
 
 
@@ -615,7 +481,7 @@ def detect_two_stage_phrase_segments(
     model_path: str | Path,
 ) -> list[dict[str, object]]:
     artifact = load_two_stage_model(str(Path(model_path).resolve()))
-    settings = dict(artifact.get("settings", {}))
+    settings = artifact["settings"]
     grid = build_predictor_grid(beat_times_sec, tempo_segments)
     if grid.n_beats < 17:
         return []
@@ -627,33 +493,34 @@ def detect_two_stage_phrase_segments(
         audio_array=audio,
         audio_sr=int(sample_rate),
     )
-    feature_z = _feature_z_from_acoustic(acoustic)
-    boundary_feature_z = _boundary_feature_matrix(
+    feature_z = feature_z_from_acoustic(acoustic)
+    boundary_feature_z = boundary_feature_matrix(
         feature_z,
-        settings.get("boundary_context_beats", (1, 2, 4, 8, 16)),
-        _grid_context_feature_matrix(feature_z, grid),
+        settings["boundary_context_beats"],
+        grid_context_feature_matrix(feature_z, grid),
+        settings["boundary_regional_context_beats"],
     )
-    valid = _valid_mask(feature_z.shape[0], int(settings.get("edge_beats", 8)))
+    structural = multi_view_structure_features(feature_z)
+    boundary_feature_z = np.hstack([boundary_feature_z, structural])
+    valid = valid_boundary_mask(feature_z.shape[0], int(settings["edge_beats"]))
     boundary_clf = artifact["boundary_clf"]
     probability = _predict_boundary_probability(boundary_clf, boundary_feature_z, valid)
-    bounds = _pick_boundaries_direct(
-        boundary_clf,
-        boundary_feature_z,
-        valid,
+    bounds = _pick_boundaries_probability(
         probability,
-        min_distance_beats=int(settings.get("min_distance_beats", 16)),
-        max_boundaries=settings.get("max_boundaries"),
+        threshold=float(settings["threshold"]),
+        min_distance_beats=int(settings["min_distance_beats"]),
+        max_boundaries=settings["max_boundaries"],
     )
     bounds = _refine_boundaries(
         bounds,
         probability,
         valid,
         np.asarray(grid.downbeat_mask, dtype=bool),
-        window_beats=int(settings.get("boundary_refine_window_beats", 8)),
-        target_lengths_beats=settings.get("boundary_lengths_beats", (16, 32, 64, 128)),
-        length_weight=float(settings.get("boundary_length_weight", 0.45)),
-        shift_penalty=float(settings.get("boundary_shift_penalty", 0.015)),
-        downbeat_bonus=float(settings.get("boundary_downbeat_bonus", 0.35)),
+        window_beats=int(settings["boundary_refine_window_beats"]),
+        target_lengths_beats=settings["boundary_lengths_beats"],
+        length_weight=float(settings["boundary_length_weight"]),
+        shift_penalty=float(settings["boundary_shift_penalty"]),
+        downbeat_bonus=float(settings["boundary_downbeat_bonus"]),
     )
 
     labels = _decode_labels(
@@ -661,11 +528,16 @@ def detect_two_stage_phrase_segments(
         np.asarray(artifact["label_transition"], dtype=np.float64),
         np.asarray(artifact["label_length_mu"], dtype=np.float64),
         np.asarray(artifact["label_length_sigma"], dtype=np.float64),
-        _label_logp(artifact["label_clf"], feature_z, bounds),
+        _label_logp(
+            artifact["label_clf"],
+            feature_z,
+            bounds,
+            settings["label_context_beats"],
+        ),
         bounds,
-        label_weight=float(settings.get("label_weight", 1.0)),
-        transition_weight=float(settings.get("transition_weight", 1.0)),
-        length_weight=float(settings.get("length_weight", 0.0)),
+        label_weight=float(settings["label_weight"]),
+        transition_weight=float(settings["transition_weight"]),
+        length_weight=float(settings["length_weight"]),
     )
 
     beat_times = np.asarray(grid.beat_times_sec, dtype=np.float64)

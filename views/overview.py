@@ -660,6 +660,7 @@ class OverviewWidget(QtWidgets.QWidget):
 
     def _on_phrases_updated(self) -> None:
         self._render_phrases()
+        self._render_cue_points()
 
     def _render_phrases(self) -> None:
         feats = self.model.features or {}

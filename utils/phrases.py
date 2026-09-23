@@ -46,8 +46,10 @@ _FALLBACK_PALETTE: list[tuple[int, int, int]] = [
 ]
 
 
-# Phrases shorter than this (seconds) are treated as zero-length and dropped.
-MIN_PHRASE_DUR = 1e-6
+# Phrase boundaries are persisted as float32.  At track-scale timestamps its
+# resolution is around 10-30 microseconds, so sub-0.1 ms fragments can collapse
+# to zero on save and become impossible to select in the editor.
+MIN_PHRASE_DUR = 1e-4
 
 
 def normalize_base_label(label: object) -> str:
@@ -65,7 +67,24 @@ def phrase_color(base_label: str) -> tuple[int, int, int]:
     return _FALLBACK_PALETTE[hash(key) % len(_FALLBACK_PALETTE)]
 
 
-def _sorted_phrases(phrases) -> list[dict[str, Any]]:
+def normalize_phrase_segments(
+    phrases,
+    *,
+    min_time: float | None = None,
+    max_time: float | None = None,
+) -> list[dict[str, Any]]:
+    """Return finite, ordered, non-overlapping Phrase segments.
+
+    Optional time bounds clip stale segments left behind after beatgrid or
+    duration edits.  Tiny float precision slivers are removed before they can
+    collapse into zero-length float32 records.
+    """
+
+    lower = float(min_time) if min_time is not None and math.isfinite(min_time) else None
+    upper = float(max_time) if max_time is not None and math.isfinite(max_time) else None
+    if lower is not None and upper is not None and upper < lower:
+        lower, upper = upper, lower
+
     rows: list[dict[str, Any]] = []
     for p in phrases or []:
         try:
@@ -73,12 +92,35 @@ def _sorted_phrases(phrases) -> list[dict[str, Any]]:
             end = float(p.get("end"))
         except Exception:
             continue
-        if not (math.isfinite(start) and math.isfinite(end)) or end - start <= MIN_PHRASE_DUR:
-            continue  # drop zero-length (and degenerate sub-microsecond) phrases
+        if not (math.isfinite(start) and math.isfinite(end)):
+            continue
+        if lower is not None:
+            start = max(start, lower)
+            end = max(end, lower)
+        if upper is not None:
+            start = min(start, upper)
+            end = min(end, upper)
+        if end - start <= MIN_PHRASE_DUR:
+            continue
         label = normalize_base_label(p.get("label"))
         rows.append({"start": start, "end": end, "label": label})
     rows.sort(key=lambda r: r["start"])
-    return rows
+
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        current = dict(row)
+        if normalized:
+            previous_end = float(normalized[-1]["end"])
+            if float(current["start"]) < previous_end + MIN_PHRASE_DUR:
+                current["start"] = previous_end
+        if float(current["end"]) - float(current["start"]) <= MIN_PHRASE_DUR:
+            continue
+        normalized.append(current)
+    return normalized
+
+
+def _sorted_phrases(phrases) -> list[dict[str, Any]]:
+    return normalize_phrase_segments(phrases)
 
 
 def number_phrase_labels(phrases) -> list[str]:
@@ -148,23 +190,20 @@ def assign_phrase_to_selection(phrases, start: float, end: float, base_label: st
         if s < start:
             left = dict(seg)
             left["end"] = start
-            if left["end"] - left["start"] > 1e-9:
-                result.append(left)
+            result.append(left)
         if not inserted:
             result.append(dict(new_seg))
             inserted = True
         if e > end:
             right = dict(seg)
             right["start"] = end
-            if right["end"] - right["start"] > 1e-9:
-                result.append(right)
+            result.append(right)
     if not inserted:
         result.append(dict(new_seg))
 
     # Adjacent segments that share a label are kept separate (not merged), so
     # repeated sections stay individually numbered (e.g. VERSE1, VERSE2).
-    result.sort(key=lambda r: r["start"])
-    return result
+    return normalize_phrase_segments(result)
 
 
 def clear_phrase_in_selection(phrases, start: float, end: float) -> list[dict[str, Any]]:
@@ -182,14 +221,12 @@ def clear_phrase_in_selection(phrases, start: float, end: float) -> list[dict[st
         if s < start:
             left = dict(seg)
             left["end"] = start
-            if left["end"] - left["start"] > 1e-9:
-                result.append(left)
+            result.append(left)
         if e > end:
             right = dict(seg)
             right["start"] = end
-            if right["end"] - right["start"] > 1e-9:
-                result.append(right)
-    return result
+            result.append(right)
+    return normalize_phrase_segments(result)
 
 
 def build_phrase_segments_np(phrases) -> Dict[str, np.ndarray]:
@@ -201,10 +238,24 @@ def build_phrase_segments_np(phrases) -> Dict[str, np.ndarray]:
             "end": np.asarray([], dtype=np.float32),
             "label": np.asarray([], dtype="U1"),
         }
+    starts = np.asarray([r["start"] for r in rows], dtype=np.float32)
+    ends = np.asarray([r["end"] for r in rows], dtype=np.float32)
+    # Validate after quantization too: distinct float64 boundaries can map to
+    # the same float32 timestamp at the end of a long track.
+    valid = (ends.astype(np.float64) - starts.astype(np.float64)) > MIN_PHRASE_DUR
+    rows = [row for row, keep in zip(rows, valid) if bool(keep)]
+    starts = starts[valid]
+    ends = ends[valid]
+    if not rows:
+        return {
+            "start": np.asarray([], dtype=np.float32),
+            "end": np.asarray([], dtype=np.float32),
+            "label": np.asarray([], dtype="U1"),
+        }
     label_width = max(1, max(len(r["label"]) for r in rows))
     return {
-        "start": np.asarray([r["start"] for r in rows], dtype=np.float32),
-        "end": np.asarray([r["end"] for r in rows], dtype=np.float32),
+        "start": starts,
+        "end": ends,
         "label": np.asarray([r["label"] for r in rows], dtype=f"U{label_width}"),
     }
 
@@ -245,18 +296,66 @@ def extract_phrase_segments(features: Dict[str, Any]) -> List[dict[str, Any]]:
     return _sorted_phrases(rows)
 
 
-def _is_fill_label(label: object) -> bool:
-    return str(label or "").strip().upper() in {"FILL_IN", "FILL_OUT", "FILL"}
+def merge_fill_phrases(
+    phrases,
+    *,
+    include_legacy_fill: bool = True,
+    orphan_fallback: bool = False,
+) -> List[dict[str, Any]]:
+    """Absorb fill ranges into their adjacent non-fill phrase.
 
+    FILL_IN belongs to the following phrase and FILL_OUT belongs to the
+    preceding phrase. ``orphan_fallback`` permits training data at a track edge
+    to use the opposite neighbour. Legacy ``FILL`` handling can be disabled by
+    current-format consumers.
+    """
 
-def _find_neighbor_label(rows: list[dict[str, Any]], index: int, step: int) -> str:
-    pos = index + step
-    while 0 <= pos < len(rows):
-        label = rows[pos]["label"]
-        if not _is_fill_label(label):
-            return label
-        pos += step
-    return ""
+    rows = _sorted_phrases(phrases)
+    if not rows:
+        return []
+    fill_labels = {"FILL_IN", "FILL_OUT"}
+    if include_legacy_fill:
+        fill_labels.add("FILL")
+
+    def nearest_nonfill(index: int, step: int) -> int | None:
+        position = index + step
+        while 0 <= position < len(rows):
+            if str(rows[position]["label"]).strip().upper() not in fill_labels:
+                return position
+            position += step
+        return None
+
+    labeled: list[tuple[dict[str, Any], bool]] = []
+    for index, row in enumerate(rows):
+        label = str(row["label"]).strip().upper()
+        if label in fill_labels:
+            preferred_step = 1 if label == "FILL_IN" else -1
+            target = nearest_nonfill(index, preferred_step)
+            if target is None and orphan_fallback:
+                target = nearest_nonfill(index, -preferred_step)
+            if target is None:
+                continue
+            current = {**row, "label": rows[target]["label"]}
+            labeled.append((current, True))
+        else:
+            labeled.append((dict(row), False))
+
+    merged: list[dict[str, Any]] = []
+    merged_absorbed: list[bool] = []
+    for current, from_fill in labeled:
+        if (
+            merged
+            and merged[-1]["label"] == current["label"]
+            and abs(float(merged[-1]["end"]) - float(current["start"]))
+            <= MIN_PHRASE_DUR
+            and (merged_absorbed[-1] or from_fill)
+        ):
+            merged[-1]["end"] = max(merged[-1]["end"], current["end"])
+            merged_absorbed[-1] = merged_absorbed[-1] or from_fill
+        else:
+            merged.append(current)
+            merged_absorbed.append(from_fill)
+    return normalize_phrase_segments(merged)
 
 
 def merge_fill_phrases_for_display(phrases) -> List[dict[str, Any]]:
@@ -265,50 +364,11 @@ def merge_fill_phrases_for_display(phrases) -> List[dict[str, Any]]:
     FILL_IN is shown as part of the following non-fill phrase. FILL_OUT is shown
     as part of the previous non-fill phrase. Orphan fills are omitted.
     """
-    rows = _sorted_phrases(phrases)
-    if not rows:
-        return []
-
-    display: list[dict[str, Any]] = []
-    for index, seg in enumerate(rows):
-        label = str(seg["label"] or "").strip()
-        upper = label.upper()
-        from_fill = False
-        if upper == "FILL_IN":
-            label = _find_neighbor_label(rows, index, 1)
-            from_fill = True
-        elif upper in {"FILL_OUT", "FILL"}:
-            label = _find_neighbor_label(rows, index, -1)
-            from_fill = True
-        if not label:
-            continue
-        display.append(
-            {
-                "start": seg["start"],
-                "end": seg["end"],
-                "label": label,
-                "_from_fill": from_fill,
-            }
-        )
-
-    merged: list[dict[str, Any]] = []
-    for seg in display:
-        if (
-            merged
-            and merged[-1]["label"] == seg["label"]
-            and abs(float(merged[-1]["end"]) - float(seg["start"])) <= 1e-6
-            and (bool(merged[-1].get("_from_fill")) or bool(seg.get("_from_fill")))
-        ):
-            merged[-1]["end"] = seg["end"]
-            merged[-1]["_from_fill"] = bool(merged[-1].get("_from_fill")) or bool(
-                seg.get("_from_fill")
-            )
-        else:
-            merged.append(dict(seg))
-    return [
-        {"start": seg["start"], "end": seg["end"], "label": seg["label"]}
-        for seg in merged
-    ]
+    return merge_fill_phrases(
+        phrases,
+        include_legacy_fill=True,
+        orphan_fallback=False,
+    )
 
 
 def extract_fill_phrase_markers(phrases) -> List[dict[str, Any]]:

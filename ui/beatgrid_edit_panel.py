@@ -18,7 +18,7 @@ from core.linear_segments import build_bpm_segments, build_key_segments
 from core.beat_geometry import bar_beat_position, downbeat_beat_indices
 from utils.keystrip import build_keystrip_buffer
 from utils.labels import KEY_DISPLAY_LABELS
-from utils.jump_cues import build_jump_cues_np, extract_jump_cue_pairs, build_jump_cue_graph
+from utils.jump_cues import build_jump_cues_np, build_jump_cue_graph
 from utils.jumpcue_colors import get_jumpcue_pair_color
 from utils.phrases import (
     PHRASE_LABELS,
@@ -26,8 +26,10 @@ from utils.phrases import (
     build_phrase_segments_np,
     clear_phrase_in_selection,
     extract_phrase_segments,
+    normalize_phrase_segments,
     number_phrase_labels,
 )
+from utils.cue_points import build_cue_points_np, build_phrase_cue_points
 
 MAX_LOG_HISTORY = 50
 BUTTON_STYLESHEET = """
@@ -154,6 +156,12 @@ class SaveWorker(QtCore.QObject):
                 prev_feat["jump_cues_extracted"] = jump_cues_extracted
             if phrase_segments_np is not None:
                 prev_feat["phrase_segments_np"] = phrase_segments_np
+                phrase_rows = extract_phrase_segments(
+                    {"phrase_segments_np": phrase_segments_np}
+                )
+                prev_feat["cue_points_np"] = build_cue_points_np(
+                    build_phrase_cue_points(phrase_rows)
+                )
             store.save(uid, prev_feat)
             db = LibraryDB(os.path.join(libpath, "library.db"))
             db.connect()
@@ -698,7 +706,15 @@ class BeatgridEditPanel(QtWidgets.QWidget):
         self.btn_save.setStyleSheet(BUTTON_STYLESHEET)
     
     def set_track_duration(self, duration):
-        self.duration = float(duration)
+        value = float(duration or 0.0)
+        self.duration = value if np.isfinite(value) and value > 0.0 else 0.0
+        if self.duration > 0.0 and self._phrase_segments:
+            self._phrase_segments = normalize_phrase_segments(
+                self._phrase_segments,
+                min_time=0.0,
+                max_time=self.duration,
+            )
+            self._broadcast_phrase()
 
     def set_segments(self, beatgrid: np.ndarray, segments: Optional[np.ndarray]) -> None:
         """Set tempo segments: (N, 5) [start, end, bpm, inizio, ts_num]."""
@@ -1341,6 +1357,11 @@ class BeatgridEditPanel(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Invalid JumpCUE Label", str(exc))
             return
         jump_cues_extracted = copy.deepcopy(self._JumpCUE)
+        self._phrase_segments = normalize_phrase_segments(
+            self._phrase_segments,
+            min_time=0.0,
+            max_time=self.duration if self.duration > 0.0 else None,
+        )
         phrase_segments_np = build_phrase_segments_np(self._phrase_segments)
         self._save_in_progress = True
         self.btn_save.setEnabled(False)
@@ -1689,7 +1710,11 @@ class BeatgridEditPanel(QtWidgets.QWidget):
             self.btn_save.setStyleSheet(WARNING_BUTTON_STYLESHEET)
         if self.model is not None:
             try:
-                self.model.features["phrase_segments_np"] = build_phrase_segments_np(self._phrase_segments)
+                phrase_segments_np = build_phrase_segments_np(self._phrase_segments)
+                self.model.features["phrase_segments_np"] = phrase_segments_np
+                self.model.features["cue_points_np"] = build_cue_points_np(
+                    build_phrase_cue_points(self._phrase_segments)
+                )
             except Exception:
                 pass
         self._update_phrase_status()
