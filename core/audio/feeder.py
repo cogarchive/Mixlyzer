@@ -1,28 +1,34 @@
 # audio/feeder.py
 from __future__ import annotations
-from typing import Optional, Deque, Tuple
-from collections import deque
+import math
+import time
+from typing import Optional
 
 import numpy as np
 from PySide6 import QtCore, QtMultimedia
 
-from core.audio.dsp import SpeedResampler  # provides set_factor(), process()
+from core.audio.clicks import ClickTrack
+from core.audio.dsp import SpeedResampler, fade_ramp
+from core.audio.timeline import OutputTimeline
 
 
 class PCMFeeder(QtCore.QObject):
     """
-    Predecode-only PCM feeder with precise time estimation.
+    Renders a predecoded track into a QAudioSink that is started once and never reset.
 
-    - Time/frame-based timeline API:
-        * input_playhead_abs_frame() : current playhead as absolute input frames (float)
-        * current_base_frame()       : base frame of current stream (float)
-    - Keeps playhead consistent after speed changes via recent (out_frames, in_frames) mapping.
-    - Modes: "speed" (5-tap Lagrange interp) / "none" (pass-through)
+    Paused/idle time is filled with silence instead of reset()/start() cycles, which crash
+    Qt 6.10's WASAPI stream thread. Every rendered block is recorded on an OutputTimeline,
+    so the playhead is the input position actually being heard, even while audio rendered
+    before a tempo change, seek or jump is still queued in the device.
+
+    Modes: "speed" (5-tap Lagrange varispeed) / "none" (pass-through, ignores factor).
+    Metronome clicks (`clicks`) are mixed into the same stream; music volume is applied here
+    too, so the click level stays independent of it.
     """
 
-    finished = QtCore.Signal(int)  # playback finished signal (code 0)
-    peak_level = QtCore.Signal(float)  # peak dBFS
-    playhead_time = QtCore.Signal(float)  # precise playback time in sec
+    finished = QtCore.Signal()  # the last frame of the track has been heard
+
+    PEAK_FLOOR_DBFS = -24.0
 
     def __init__(self, audio: QtMultimedia.QAudioSink, rate: int, channels: int,
                  parent: Optional[QtCore.QObject] = None):
@@ -30,313 +36,290 @@ class PCMFeeder(QtCore.QObject):
         self.audio = audio
         self.rate = int(rate)
         self.ch = int(channels)
+        self._bpf = self.ch * 4  # float32
 
-        # Device handle
         self.dev: Optional[QtCore.QIODevice] = None
+        self._flush_timer: Optional[QtCore.QTimer] = None
+        self._chunk_frames = 2048                          # max frames rendered per block
+        self._idle_queue_frames = max(1, self.rate // 50)  # ~20 ms of silence while paused
+        self._fade_frames = max(1, self.rate // 250)       # ~4 ms declick fades/crossfades
+        self._restart_at = 0.0
 
-        # Decoded buffer
+        self._timeline = OutputTimeline(self._bpf)
+        self.clicks = ClickTrack(self.rate, self.ch)
+        self._resampler = SpeedResampler(self.ch)
+
+        # Track
         self._pcm: Optional[np.ndarray] = None   # [N, ch] float32
         self._len: int = 0
-        self._read_idx: int = 0                  # next frame index to consume/output
 
-        # DSP
+        # Render head (input frames)
+        self._pos: float = 0.0
+        self._playing = False
+        self._scrubbing = False
+        self._seeked_while_paused = False
         self._mode = "speed"
         self._factor = 1.0
-        self._speed = SpeedResampler(self.ch)
+        self._music_gain = 1.0
+        self._jump_start: Optional[float] = None
+        self._jump_dest: Optional[float] = None
 
-        # Timer/output control
-        self._flush_timer: Optional[QtCore.QTimer] = None
-        self._chunk_frames = 2048                # max frames to output per flush
-        # Time/progress tracking (input-based)
-        self._abs_base_frames: int = 0           # base frame since last seek
-        self._total_in_consumed: int = 0         # total consumed input frames
-
-        # Output/input mapping (for delay correction)
-        # Elements: (out_frames:int, in_frames:int)
-        self._out_map: Deque[Tuple[int, int]] = deque()
-        self._out_map_out_total: int = 0         # total out_frames remaining in deque
-
-        # Prevent duplicate finish handling and track jump state
-        self._sent_finished = False
-        self._jump_start = None
-        self._jump_dest = None
-        self._feeder_prev_t = 0
-        self._last_written_frames = 0
-        self._peak_emit_interval_ms = 16
-        self._peak_floor_dbfs = -24.0
-        self._last_peak_emit_ms = -10**9
-        self._time_emit_interval_ms = 5
-        self._last_time_emit_ms = -10**9
-
-    # Configuration API
-    def set_predecoded_buffer(self, pcm: np.ndarray):
-        """Set decoded PCM ([N, ch] float32)."""
-        assert pcm.ndim == 2 and pcm.shape[1] == self.ch, "pcm shape must be [N, ch]"
-        self._pcm = np.asarray(pcm, dtype=np.float32, order="C")
-        self._len = int(self._pcm.shape[0])
-        self._read_idx = 0
-
-        # Reset base counters
-        self._abs_base_frames = 0
-        self._total_in_consumed = 0
-        self._speed.pos = 0.0
-
-        # Reset mapping
-        self._out_map.clear()
-        self._out_map_out_total = 0
+        # End of track
+        self._end_out_frame: Optional[int] = None  # output frame where the track ran out
         self._sent_finished = False
 
-        self._jump_start = None
-        self._jump_dest = None
-        self._feeder_prev_t = 0
-        self._last_written_frames = 0
-        self._last_peak_emit_ms = -10**9
-        self._last_time_emit_ms = -10**9
-
-    def set_mode(self, mode: str):
-        m = (mode or "speed").lower()
-        self._mode = m if m in ("none", "speed") else "speed"
-
-    def set_factor(self, f: float):
-        f = float(max(0.25, min(4.0, f)))
-        self._factor = f
-        self._speed.set_factor(f)
-
-    def set_peak_emit_interval_ms(self, interval_ms: int) -> None:
-        self._peak_emit_interval_ms = max(1, int(interval_ms))
-
-    def is_empty(self) -> bool:
-        return (self._pcm is None) or (self._read_idx >= self._len)
-
-    def start(self):
-        """Start audio output (create timer)."""
-        self.stop()
-        self.dev = self.audio.start()
-        self._flush_timer = QtCore.QTimer(self)
-        self._flush_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self._flush_timer.setInterval(1)
-        self._flush_timer.timeout.connect(self._flush)
+    # Lifecycle
+    def open(self) -> None:
+        """Start the sink and the feed timer. Called once; the sink then runs until close()."""
+        if self._flush_timer is None:
+            self._flush_timer = QtCore.QTimer(self)
+            self._flush_timer.setTimerType(QtCore.Qt.PreciseTimer)
+            self._flush_timer.setInterval(1)
+            self._flush_timer.timeout.connect(self._flush)
+        self._start_sink()
         self._flush_timer.start()
-        self._sent_finished = False
-        self._last_peak_emit_ms = -10**9
-        self._last_time_emit_ms = -10**9
 
-    def stop(self):
-        """Stop audio/timer; leave time tracking/mapping intact."""
-        if self._flush_timer:
-            try:
-                self._flush_timer.timeout.disconnect(self._flush)
-            except Exception:
-                pass
+    def close(self) -> None:
+        if self._flush_timer is not None:
             self._flush_timer.stop()
-            self._flush_timer.deleteLater()
-            self._flush_timer = None
-
+        self._playing = False
+        self.dev = None
         try:
-            self.audio.reset()  # clear buffer
+            self.audio.stop()
         except Exception:
             pass
 
-        self.dev = None
-        self._speed.pos = 0.0
-        self._sent_finished = False
-        self.peak_level.emit(float(self._peak_floor_dbfs))
-        self.playhead_time.emit(float(self.current_base_frame() / max(1, self.rate)))
-
-    def seek_frames(self, f_idx: int):
-        """Jump to input-frame index (without resetting the device)."""
-        f_idx = int(max(0, min(f_idx, self._len)))
-        self._abs_base_frames = f_idx
-        self._read_idx = f_idx
-        self._total_in_consumed = 0
-        self._speed.pos = 0.0
-        self.playhead_time.emit(float(self._abs_base_frames / max(1, self.rate)))
-
-    def reset_counters(self):
-        """Reset base counters to clear delay-compensation mapping."""
-        self._total_in_consumed = 0
-        self._speed.pos = 0.0
-        self._out_map.clear()
-        self._out_map_out_total = 0
-
-    # Time API
-    def _queued_out_frames_float(self) -> float:
-        """Estimate queued 'output' frames in the device as float."""
-        if not self.audio:
-            return 0.0
-        bpf = self.ch * 4  # float32
+    def _start_sink(self) -> None:
+        self._timeline.reset()
+        self._end_out_frame = None
         try:
-            buf_sz = max(bpf, int(self.audio.bufferSize()))
-            bytes_free = max(0, int(self.audio.bytesFree()))
-            queued_bytes = max(0, buf_sz - bytes_free)
-            return float(queued_bytes) / float(bpf)
-        except Exception:
-            return 0.0
+            self.dev = self.audio.start()
+        except Exception as exc:
+            print(f"[Feeder] Audio sink start failed: {exc}")
+            self.dev = None
 
-    def _queued_input_frames_float(self) -> float:
-        """
-        Estimate queued frames in *input* frame units.
-        In speed mode, queued device frames correspond to more/less source
-        frames depending on the playback factor.
-        """
-        q_out = self._queued_out_frames_float()
-        if q_out <= 0.0:
-            return 0.0
-        if self._mode == "speed":
-            return q_out * float(max(0.25, min(4.0, self._factor)))
-        return q_out
+    def _sink_running(self) -> bool:
+        """Restart the sink (at most once per second) only if it died on its own, e.g. device loss."""
+        if self.dev is not None and self.audio.state() != QtMultimedia.QtAudio.State.StoppedState:
+            return True
+        now = time.monotonic()
+        if now < self._restart_at:
+            return False
+        self._restart_at = now + 1.0
+        print(f"[Feeder] Audio sink stopped (error={self.audio.error()}); restarting")
+        self._start_sink()
+        return self.dev is not None
 
-    def input_playhead_frames(self) -> float:
-        """
-        Return current position (frames, float) with delay compensated in *input* terms.
-        = (total input consumed + interpolation fraction) - (input delay from queued output frames)
-        """
-        total_in_f = float(self._total_in_consumed) + float(getattr(self._speed, "pos", 0.0))
-
-        q_out = self._queued_out_frames_float()
-        if q_out <= 1e-9 or not self._out_map:
-            return max(0.0, total_in_f)
-
-        need = q_out
-        in_delay = 0.0
-        for o, i in reversed(self._out_map):
-            if need <= 1e-9:
-                break
-            take = min(need, float(o))
-            if o > 0:
-                in_delay += float(i) * (take / float(o))
-            need -= take
-
-        return max(0.0, total_in_f - in_delay)
-
-    def input_playhead_abs_frame(self) -> float:
-        """Return absolute input-frame playhead (float) during playback."""
-        return float(self._abs_base_frames) + self.input_playhead_frames()
-
-    def current_base_frame(self) -> float:
-        """Return base frame of the playing track (float)."""
-        return float(self._abs_base_frames)
-    
-    def arm_jump(self, start, dest):
-        self._jump_start = start
-        self._jump_dest = dest
-    
-    def disarm_jump(self):
+    # Configuration
+    def set_track(self, pcm: Optional[np.ndarray]) -> None:
+        """Load decoded PCM ([N, ch] float32), or None to unload. Stops playback at frame 0."""
+        self.pause()
+        if pcm is None:
+            self._pcm = None
+            self._len = 0
+        else:
+            assert pcm.ndim == 2 and pcm.shape[1] == self.ch, "pcm shape must be [N, ch]"
+            self._pcm = np.asarray(pcm, dtype=np.float32, order="C")
+            self._len = int(self._pcm.shape[0])
+        self._pos = 0.0
+        self._end_out_frame = None
+        self._sent_finished = False
+        self._seeked_while_paused = True
         self._jump_start = None
         self._jump_dest = None
-        frame = self.input_playhead_abs_frame()
-        self._feeder_prev_t = frame / self.rate
+        self.clicks.clear_voices()
 
-    # Playback loop
+    def set_mode(self, mode: str) -> None:
+        m = (mode or "speed").lower()
+        self._mode = m if m in ("none", "speed") else "speed"
+
+    def set_factor(self, f: float) -> None:
+        """Applies to audio rendered from now on; queued audio keeps the speed it was rendered at."""
+        self._factor = float(max(0.25, min(4.0, f)))
+
+    def set_music_gain(self, gain: float) -> None:
+        self._music_gain = float(max(0.0, gain))
+
+    def set_scrubbing(self, scrubbing: bool) -> None:
+        """Clicks only sound during normal playback, so they are muted while scrubbing."""
+        self._scrubbing = bool(scrubbing)
+        if self._scrubbing:
+            self.clicks.clear_voices()
+
+    def _step(self) -> float:
+        return self._factor if self._mode == "speed" else 1.0
+
+    # Transport (positions in input frames)
+    def is_playing(self) -> bool:
+        return self._playing
+
+    def play(self) -> bool:
+        if self._playing:
+            return True
+        if self._pcm is None or self._pos >= self._len:
+            return False
+        self._playing = True
+        self._seeked_while_paused = False
+        self._sent_finished = False
+        self._end_out_frame = None
+        head = self._render(self._pos, self._fade_frames)
+        head *= fade_ramp(head.shape[0], self._fade_frames, rising=True)
+        self._append(head, self._pos, self._step())
+        self._pos += self._step() * head.shape[0]
+        return True
+
+    def pause(self) -> None:
+        if not self._playing:
+            return
+        self._playing = False
+        if self._pos < self._len:
+            tail = self._render(self._pos, self._fade_frames)
+            tail *= fade_ramp(tail.shape[0], self._fade_frames, rising=False)
+            self._append(tail, self._pos, self._step())
+            self._pos += self._step() * tail.shape[0]
+
+    def seek(self, frame: float) -> None:
+        target = float(max(0, min(frame, self._len)))
+        self._end_out_frame = None
+        self._sent_finished = False
+        if self._playing and self._pcm is not None:
+            self._crossfade_to(target)
+        else:
+            self._pos = target
+            self._seeked_while_paused = True
+
+    def arm_jump(self, start_sec, dest_sec) -> None:
+        if start_sec is None or dest_sec is None:
+            self.disarm_jump()
+            return
+        self._jump_start = float(start_sec) * self.rate
+        self._jump_dest = float(dest_sec) * self.rate
+
+    def disarm_jump(self) -> None:
+        self._jump_start = None
+        self._jump_dest = None
+
+    # What is being heard
+    def _queued_bytes(self) -> int:
+        try:
+            buf_sz = max(self._bpf, int(self.audio.bufferSize()))
+            bytes_free = max(0, int(self.audio.bytesFree()))
+            return max(0, buf_sz - bytes_free)
+        except Exception:
+            return 0
+
+    def _heard_out_frame(self) -> float:
+        return self._timeline.heard_frame(self._queued_bytes())
+
+    def playhead_frame(self) -> float:
+        """Input frame currently being heard."""
+        if not self._playing and self._seeked_while_paused:
+            return self._pos
+        out_frame = self._heard_out_frame()
+        seg = self._timeline.segment_at(out_frame)
+        if seg is None:
+            first = self._timeline.first_segment()
+            return first.in_start if first is not None else self._pos
+        if seg.step == 0.0:
+            return self._pos if not self._playing else seg.in_start
+        return seg.in_start + min(out_frame - seg.out_start, seg.frames) * seg.step
+
+    def heard_peak_dbfs(self) -> float:
+        """Pre-volume peak of the block being heard."""
+        seg = self._timeline.segment_at(self._heard_out_frame())
+        return seg.peak_dbfs if seg is not None else self.PEAK_FLOOR_DBFS
+
+    # Rendering
+    def _render(self, pos: float, n_out: int) -> np.ndarray:
+        if self._pcm is None:
+            return np.zeros((0, self.ch), np.float32)
+        return self._resampler.render(self._pcm, pos, self._step(), n_out)
+
+    def _append(self, out: np.ndarray, in_start: float, step: float) -> None:
+        n = int(out.shape[0])
+        if n <= 0:
+            return
+        peak = float(np.max(np.abs(out))) if step > 0.0 else 0.0
+        peak_dbfs = 20.0 * math.log10(min(max(peak, 1e-12), 1.0))
+        peak_dbfs = max(self.PEAK_FLOOR_DBFS, min(0.0, peak_dbfs))
+        if step > 0.0:
+            if self._music_gain != 1.0:
+                out = out * np.float32(self._music_gain)
+            if self._playing and not self._scrubbing:
+                self.clicks.queue(in_start, step, n)
+        out = self.clicks.mix(out)
+        self._timeline.append(out, in_start, step, peak_dbfs)
+
+    def _append_silence(self, n: int) -> None:
+        hold = self._pos if self._pos < self._len else float(self._len)
+        self._append(np.zeros((n, self.ch), np.float32), hold, 0.0)
+
+    def _crossfade_to(self, target: float) -> None:
+        """Fade out the audio continuing from the render head while fading in `target`."""
+        target = float(max(0.0, min(target, self._len)))
+        n = self._fade_frames
+        tail = self._render(self._pos, n) if self._pos < self._len else np.zeros((0, self.ch), np.float32)
+        head = self._render(target, n)
+        k = head.shape[0]
+        mix = head * fade_ramp(k, n, rising=True)
+        if tail.shape[0]:
+            t = min(k, tail.shape[0])
+            mix[:t] += tail[:t] * fade_ramp(t, n, rising=False)
+        self._append(mix, target, self._step())
+        self._pos = target + self._step() * k
+
+    def _render_block(self, n_out: int) -> None:
+        step = self._step()
+        js, jd = self._jump_start, self._jump_dest
+        if js is not None and jd is not None and self._pos < js <= self._pos + step * n_out:
+            # Cut exactly at the jump point and keep the sub-frame phase at the destination.
+            n1 = int(math.ceil((js - self._pos) / step))
+            if n1 > 0:
+                out = self._render(self._pos, n1)
+                self._append(out, self._pos, step)
+                self._pos += step * out.shape[0]
+            self._crossfade_to(jd + (self._pos - js))
+            return
+
+        out = self._render(self._pos, n_out)
+        self._append(out, self._pos, step)
+        self._pos += step * out.shape[0]
+        if self._pos >= self._len and self._end_out_frame is None:
+            self._pos = float(self._len)
+            self._end_out_frame = self._timeline.rendered_frames
+
+    # Feed loop
     @QtCore.Slot()
-    def _flush(self):
-        if self._jump_start != None and self._jump_dest != None:
-            frame = self.input_playhead_abs_frame()
-            t = frame / self.rate
-            if self._feeder_prev_t < self._jump_start and t > self._jump_start:
-                # Keep device running; skip only what is already queued to avoid stutter
-                queued_in = self._queued_input_frames_float()
-                safety = min(int(self._chunk_frames * max(1.0, self._factor)), int(round(queued_in)))
-                target_frame = int(round(self._jump_dest * self.rate + safety))
-                self.seek_frames(target_frame)
-                self.reset_counters()  # clear delay map so playhead math matches new base
-                self._last_written_frames = 0
-                self._feeder_prev_t = target_frame / self.rate
-                frame = self.input_playhead_abs_frame()
-                t = frame / self.rate
-            self._feeder_prev_t = t
-
-        if not (self.dev and self.audio and self._pcm is not None):
+    def _flush(self) -> None:
+        if not self._sink_running():
             return
+        for _ in range(4):
+            if not self._timeline.write_to(self.dev):
+                break  # device full; retry next tick
 
-        # Estimate how many output frames the device needs
-        bpf = self.ch * 4
-        try:
-            frames_free = max(0, int(self.audio.bytesFree())) // bpf
-        except Exception:
-            frames_free = 0
-        if frames_free <= 0:
-            self._emit_playhead_time()
-            return
+            try:
+                frames_free = max(0, int(self.audio.bytesFree())) // self._bpf
+            except Exception:
+                frames_free = 0
+            if not self._playing:
+                # Keep only a short silence queue so play() is heard promptly.
+                frames_free = min(frames_free, self._idle_queue_frames - self._queued_bytes() // self._bpf)
+            n = min(frames_free, self._chunk_frames)
+            if n <= 0:
+                break
+            if self._playing and self._pos < self._len:
+                self._render_block(n)
+            else:
+                self._append_silence(n)
 
-        max_out_frames = min(frames_free, self._chunk_frames)
+        heard = self._heard_out_frame()
+        self._timeline.prune(heard)
 
-        # If source drained, emit finished once
-        if self._read_idx >= self._len:
-            self._emit_playhead_time()
-            if not self._sent_finished:
-                self._sent_finished = True
-                self.finished.emit(0)
-            return
-
-        # Input block to process this loop (slightly generous)
-        # In speed mode, IO ratio depends on factor so leave headroom.
-        take_in = min(self._len - self._read_idx, int(max_out_frames * self._factor) + 8)
-        in_block = self._pcm[self._read_idx : self._read_idx + take_in]
-
-        # Convert
-        if self._mode == "speed":
-            out, consumed = self._speed.process(in_block, max_out_frames)
-            produced = int(out.shape[0])
-            self._last_written_frames = produced
-        else:  # 'none' pass-through (ignore factor)
-            take = min(max_out_frames, in_block.shape[0])
-            out = in_block[:take]
-            consumed = int(take)
-            produced = int(take)
-            self._last_written_frames = produced
-
-        if produced <= 0:
-            self._emit_playhead_time()
-            return
-        
-
-        # Progress bookkeeping
-        self._read_idx += int(consumed)          # input-based cursor
-        self._total_in_consumed += int(consumed) # cumulative input consumption
-
-        # Write to audio device
-        try:
-            self.dev.write(out.astype("<f4", copy=False).tobytes())
-        except Exception:
-            # Ignore device errors and retry next loop
-            return
-
-        self._emit_peak_level(out)
-        self._emit_playhead_time()
-
-        # Output/input mapping metadata (for delay correction)
-        self._out_map.append((int(produced), int(consumed)))
-        self._out_map_out_total += int(produced)
-
-        # Memory/queue hygiene: keep at most 2x audio buffer size (bufferSize/bpf)
-        try:
-            dev_cap_out = max(1, int(self.audio.bufferSize()) // bpf)
-        except Exception:
-            dev_cap_out = max(1, self._chunk_frames * 2)
-
-        keep_out = max(1, dev_cap_out * 2)
-        while self._out_map and self._out_map_out_total > keep_out:
-            o, _i = self._out_map.popleft()
-            self._out_map_out_total -= int(o)
-
-    def _emit_peak_level(self, out: np.ndarray) -> None:
-        if out.size == 0:
-            return
-        now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
-        if (now_ms - self._last_peak_emit_ms) < int(self._peak_emit_interval_ms):
-            return
-        peak = float(np.max(np.abs(out)))
-        peak = min(max(peak, 1e-12), 1.0)
-        dbfs = 20.0 * float(np.log10(peak))
-        dbfs = max(self._peak_floor_dbfs, min(0.0, dbfs))
-        self._last_peak_emit_ms = now_ms
-        self.peak_level.emit(dbfs)
-
-    def _emit_playhead_time(self, *, force: bool = False) -> None:
-        now_ms = int(QtCore.QDateTime.currentMSecsSinceEpoch())
-        if (not force) and ((now_ms - self._last_time_emit_ms) < int(self._time_emit_interval_ms)):
-            return
-        self._last_time_emit_ms = now_ms
-        cur_sec = float(self.input_playhead_abs_frame() / max(1, self.rate))
-        self.playhead_time.emit(cur_sec)
+        if (
+            self._playing
+            and self._end_out_frame is not None
+            and not self._sent_finished
+            and heard >= self._end_out_frame
+        ):
+            self._sent_finished = True
+            self.finished.emit()
