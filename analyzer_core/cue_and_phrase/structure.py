@@ -11,6 +11,8 @@ import librosa
 import numpy as np
 from scipy.special import expit
 
+from core.audio.decoder import decode_to_memmap
+
 
 EPS = 1e-10
 
@@ -302,13 +304,9 @@ def _load_audio_stereo(
             )
             sr = config.sample_rate
     else:
-        waveform, sr = librosa.load(
-            path=str(audio_path),
-            sr=config.sample_rate,
-            mono=False,
-            dtype=np.float32,
-            res_type=config.res_type,
-        )
+        pcm = decode_to_memmap(str(audio_path), int(config.sample_rate), ch=2)
+        waveform = np.asarray(pcm, dtype=np.float32).reshape(-1, 2).T
+        sr = int(config.sample_rate)
     if waveform.ndim == 1:
         left = waveform
         right = waveform

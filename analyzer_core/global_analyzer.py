@@ -45,10 +45,8 @@ def fast_load(path: str, target_sr, stereo: bool = False) -> np.ndarray:
     except Exception:
         try:
             y, sr = sf.read(path.as_posix(), dtype="float32", always_2d=False)
-        except Exception:
-            y, sr = librosa.load(path.as_posix(), sr=target_sr, mono=not stereo)
-            if stereo and y.ndim == 2:  # librosa returns (ch, N)
-                y = y.T
+        except Exception as exc:
+            raise RuntimeError(f"Audio decode failed via FFmpeg and SoundFile: {path}") from exc
         if stereo:
             if y.ndim == 1:
                 y = np.stack([y, y], axis=1)
