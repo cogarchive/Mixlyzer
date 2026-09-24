@@ -41,12 +41,14 @@ class AppWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         appid = "org.hygn.mixylzer"
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
-        try:
-            ctypes.windll.winmm.timeBeginPeriod(1)
-            atexit.register(lambda: ctypes.windll.winmm.timeEndPeriod(1))
-        except Exception:
-            pass
+        if os.name == "nt":
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(appid)
+            try:
+                ctypes.windll.winmm.timeBeginPeriod(1)
+                atexit.register(lambda: ctypes.windll.winmm.timeEndPeriod(1))
+            except Exception:
+                pass
+            
         self.setWindowTitle("Mixlyzer")
         self.setAcceptDrops(True)
         self.setWindowIcon(QtGui.QIcon("assets/images/mixlyzer.png"))
