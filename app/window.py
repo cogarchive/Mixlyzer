@@ -170,6 +170,11 @@ class AppWindow(QtWidgets.QMainWindow):
         self._apply_external_sync_mode(self.cfg.externalsyncconfig)
         self._apply_visibility_refresh_setting(force=True)
 
+    def closeEvent(self, e: QtGui.QCloseEvent):
+        # Stop view worker threads (e.g. WaveformRenderThread) before Qt destroys them.
+        self.pane.clear_views()
+        super().closeEvent(e)
+
     # DnD
     def dragEnterEvent(self, e: QtGui.QDragEnterEvent):
         if e.mimeData().hasUrls(): e.acceptProposedAction()
