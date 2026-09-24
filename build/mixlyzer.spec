@@ -52,7 +52,7 @@ exe = EXE(
     strip=False,
     upx=True,
     console=False,  # windowed app
-    icon=icon_path,
+    # icon=icon_path,
 )
 
 coll = COLLECT(
@@ -66,3 +66,9 @@ coll = COLLECT(
     name=app_name,
 )
 
+app = BUNDLE(
+    coll,
+    name=app_name + '.app',
+    icon=None,
+    bundle_identifier='org.hygn.mixlyzer',
+)
